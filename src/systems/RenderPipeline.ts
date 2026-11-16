@@ -151,6 +151,12 @@ class FinalGradePass extends Pass {
         uDesaturate: { value: 0 },
         uAspect: { value: 1 },
         uGrain: { value: 1 },
+        tDepth: { value: null },
+        uNearFar: { value: new THREE.Vector2(0.3, 6000) },
+        uFocus: { value: 12 },
+        uDof: { value: 0 },
+        uTexel: { value: new THREE.Vector2(1 / 1280, 1 / 720) },
+        uFlare: { value: 1 },
       },
       vertexShader: FULLSCREEN_VERTEX,
       fragmentShader: /* glsl */ `
@@ -165,7 +171,19 @@ class FinalGradePass extends Pass {
         uniform float uDesaturate;
         uniform float uAspect;
         uniform float uGrain;
+        uniform sampler2D tDepth;
+        uniform vec2 uNearFar;
+        uniform float uFocus;
+        uniform float uDof;
+        uniform vec2 uTexel;
+        uniform float uFlare;
         varying vec2 vUv;
+
+        float viewDepth(vec2 uv) {
+          float d = texture2D(tDepth, uv).x;
+          float z = d * 2.0 - 1.0;
+          return (2.0 * uNearFar.x * uNearFar.y) / max(1e-4, uNearFar.y + uNearFar.x - z * (uNearFar.y - uNearFar.x));
+        }
 
         float gHash(vec2 p) {
           vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -202,6 +220,28 @@ class FinalGradePass extends Pass {
           color.g = texture2D(tDiffuse, vUv).g;
           color.b = texture2D(tDiffuse, vUv - dir * ca).b;
 
+          // cinematic depth of field: a 12-tap golden-angle disc sized by the circle of confusion
+          if (uDof > 0.001) {
+            float depthHere = viewDepth(vUv);
+            float coc = clamp(abs(depthHere - uFocus) / max(uFocus, 1.0), 0.0, 1.0) * uDof;
+            if (coc > 0.4) {
+              vec3 acc = color;
+              float total = 1.0;
+              for (int i = 0; i < 12; i++) {
+                float fi = float(i) + 0.5;
+                float r = sqrt(fi / 12.0) * coc;
+                float a = fi * 2.39996323;
+                vec2 uv = vUv + vec2(cos(a), sin(a)) * r * uTexel;
+                vec3 tap = max(texture2D(tDiffuse, uv).rgb, 0.0);
+                // brighter taps weigh more so highlights open into bokeh discs
+                float w = 1.0 + dot(tap, vec3(0.3));
+                acc += tap * w;
+                total += w;
+              }
+              color = acc / total;
+            }
+          }
+
           // speed streaks: radial smear only at the periphery
           float smear = uSpeed * smoothstep(0.28, 0.85, radius);
           if (smear > 0.001) {
@@ -226,6 +266,38 @@ class FinalGradePass extends Pass {
               uv += delta;
             }
             color += shafts / float(RAY_SAMPLES) * uSunWeight * 1.25 * vec3(1.0, 0.72, 0.45);
+          }
+
+          // lens flare: ghosts and an anamorphic streak, gated by how much sun actually reaches the lens
+          if (uSunWeight > 0.001 && uFlare > 0.001) {
+            float vis = 0.0;
+            for (int i = 0; i < 5; i++) {
+              vec2 o = vec2(cos(float(i) * 1.2566), sin(float(i) * 1.2566)) * 0.006;
+              vec3 s = texture2D(tDiffuse, clamp(uSunScreen + o, 0.002, 0.998)).rgb;
+              vis += smoothstep(1.5, 6.0, dot(s, vec3(0.3333)));
+            }
+            vis = vis / 5.0 * uSunWeight * uFlare;
+            if (vis > 0.001) {
+              vec2 asp = vec2(uAspect, 1.0);
+              vec2 toSun = uSunScreen - 0.5;
+              vec3 flare = vec3(0.0);
+              // ghosts mirrored through the image centre
+              for (int i = 0; i < 4; i++) {
+                float k = -0.35 - float(i) * 0.42;
+                vec2 gp = 0.5 + toSun * k;
+                float size = 0.035 + float(i) * 0.028;
+                float d = length((vUv - gp) * asp) / size;
+                float ring = smoothstep(1.0, 0.82, d) * smoothstep(0.3, 0.95, d) * 0.6 + smoothstep(1.0, 0.0, d) * 0.25;
+                vec3 tint = i == 0 ? vec3(1.0, 0.55, 0.25) : i == 1 ? vec3(0.35, 0.8, 0.75) : i == 2 ? vec3(0.9, 0.4, 0.6) : vec3(0.45, 0.55, 1.0);
+                flare += tint * ring * 0.11;
+              }
+              // horizontal anamorphic streak and a faint halo ring
+              vec2 ds = (vUv - uSunScreen) * asp;
+              flare += vec3(1.0, 0.62, 0.32) * exp(-abs(ds.y) * 140.0) * exp(-abs(ds.x) * 2.6) * 0.55;
+              float halo = length(ds);
+              flare += vec3(1.0, 0.7, 0.45) * smoothstep(0.26, 0.2, halo) * smoothstep(0.14, 0.2, halo) * 0.07;
+              color += flare * vis;
+            }
           }
 
           if (any(isnan(color)) || any(isinf(color))) color = vec3(0.0);
@@ -266,6 +338,10 @@ class FinalGradePass extends Pass {
 }
 
 export type RenderFrameState = {
+  /** 0 = off. Circle-of-confusion radius in pixels (at 1080p) at full defocus; for cinematics and menus. */
+  dof?: number;
+  /** Distance in metres that stays sharp when dof > 0. */
+  focus?: number;
   time: number;
   /** 0..1 speed streak strength (boost). */
   speed: number;
@@ -290,6 +366,9 @@ export class RenderPipeline {
    * returns a black frame: 1 = no MSAA, 2 = no bloom, 3 = plain forward render.
    */
   safeLevel = 0;
+  private dof = 0;
+  private dofScale = 1;
+  private readonly lowSpec: boolean;
   private readonly scene: THREE.Scene;
 
   constructor(
@@ -299,6 +378,7 @@ export class RenderPipeline {
     lowSpec: boolean,
   ) {
     this.scene = scene;
+    this.lowSpec = lowSpec;
     renderer.toneMapping = THREE.NoToneMapping;
     this.composer = new EffectComposer(renderer);
     this.fogPass = new SceneFogPass(scene, camera, lowSpec ? 0 : 4);
@@ -335,6 +415,8 @@ export class RenderPipeline {
     this.composer.setPixelRatio(dpr);
     this.composer.setSize(width, height);
     this.finalPass.material.uniforms.uAspect.value = width / Math.max(1, height);
+    (this.finalPass.material.uniforms.uTexel.value as THREE.Vector2).set(1 / Math.max(1, width * dpr), 1 / Math.max(1, height * dpr));
+    this.dofScale = (height * dpr) / 1080;
   }
 
   render(state: RenderFrameState): void {
@@ -357,6 +439,11 @@ export class RenderPipeline {
     uniforms.uSpeed.value = state.speed;
     uniforms.uAberration.value = 0.0009 + state.impact * 0.007;
     uniforms.uDesaturate.value = state.desaturate;
+    uniforms.tDepth.value = this.fogPass.target.depthTexture;
+    (uniforms.uNearFar.value as THREE.Vector2).set(this.camera.near, this.camera.far);
+    this.dof += ((state.dof ?? 0) - this.dof) * (state.stable ? 1 : 0.12);
+    uniforms.uDof.value = this.lowSpec ? 0 : this.dof * this.dofScale;
+    uniforms.uFocus.value = state.focus ?? 12;
     this.composer.render();
     this.renderer.setRenderTarget(null);
   }

@@ -59,7 +59,28 @@ export type SfxName =
   | 'relayPowerUp'
   | 'alarm'
   | 'repair'
-  | 'overheat';
+  | 'overheat'
+  | 'missileLaunch'
+  | 'missileLock'
+  | 'pickupScrap'
+  | 'pickupRepair'
+  | 'pickupBoost'
+  | 'pickupMissile'
+  | 'combo'
+  | 'comboBreak'
+  | 'upgrade'
+  | 'lowArmor'
+  | 'nearMiss'
+  | 'driftScore'
+  | 'barrelExplosion'
+  | 'bulletWhiz'
+  | 'ricochet'
+  | 'hornBoss'
+  | 'gearShift'
+  | 'turboBlowoff'
+  | 'rankStamp'
+  | 'checkpoint'
+  | 'wreckSmash';
 
 export type MusicState = 'silent' | 'title' | 'explore' | 'event' | 'battle' | 'boss' | 'victory' | 'fail';
 
@@ -71,6 +92,8 @@ export type SfxOptions = {
   /** Playback pitch multiplier, default 1. */
   pitch?: number;
 };
+
+export type EnemyEngineSource = { distance: number; pan: number; rpm01: number; heavy: boolean };
 
 export interface GameAudio {
   /** Must be called from a user gesture. Safe to call repeatedly. */
@@ -85,6 +108,13 @@ export interface GameAudio {
   /** Wind + city ambience bed, 0..1. */
   setAmbience(intensity01: number): void;
   setMusicState(state: MusicState): void;
+  /** Combat pressure 0..1 (enemies near, low armour). Thickens the current music state; called every frame. */
+  setThreat(level01: number): void;
+  /**
+   * Positional engine growl for up to 4 nearby hostile vehicles, called every frame
+   * (pass an empty array when none). distance in metres, pan -1..1.
+   */
+  setEnemyEngines(sources: EnemyEngineSource[]): void;
   play(name: SfxName, options?: SfxOptions): void;
   /** Pause menu: duck/suspend everything; resume restores. */
   pause(): void;
@@ -94,9 +124,35 @@ export interface GameAudio {
 
 // ---------------------------------------------------------------- HUD
 
-export type HudMode = 'loading' | 'title' | 'playing' | 'cinematic' | 'paused' | 'failed' | 'complete';
+export type HudMode = 'loading' | 'title' | 'playing' | 'cinematic' | 'paused' | 'upgrade' | 'failed' | 'complete';
 
-export type HudBlip = { x: number; z: number; kind: 'enemy' | 'boss' | 'objective' | 'mortar' };
+export type HudBlip = { x: number; z: number; kind: 'enemy' | 'boss' | 'objective' | 'mortar' | 'pickup' | 'cache' | 'patrol' };
+
+/** A marker drawn over the 3D view. sx/sy are CSS pixels from the top-left of the viewport. */
+export type HudTargetMarker = {
+  sx: number;
+  sy: number;
+  /** aim = cannon auto-aim target, locking = missile lock in progress, locked = missile ready, cache = supply cache */
+  kind: 'aim' | 'locking' | 'locked' | 'cache';
+  /** 0..1: lock progress for 'locking', target health otherwise. */
+  value01: number;
+  /** Metres to the target. */
+  distanceM: number;
+};
+
+export type UpgradeOption = {
+  id: string;
+  /** Short name, e.g. "徹甲弾". */
+  name: string;
+  /** One line, e.g. "機関砲ダメージ +25%". */
+  description: string;
+  /** Which glyph the HUD should draw. */
+  icon: 'cannon' | 'armor' | 'boost' | 'missile' | 'cooling' | 'ram' | 'magnet' | 'repair';
+  /** Current level of this upgrade (0 = not owned yet). */
+  level: number;
+};
+
+export type SideObjective = { label: string; done: boolean; distanceM: number | null };
 
 export type HudFrame = {
   mode: HudMode;
@@ -128,8 +184,23 @@ export type HudFrame = {
   boss: { name: string; hp01: number } | null;
   /** Seconds since the run started. */
   elapsed: number;
-  /** Final stats, shown on the complete/failed screens. */
-  stats: { kills: number; timeSec: number; damageTaken: number };
+  /** Running score for the session. */
+  score: number;
+  /** Kill/style chain. timer01 drains to 0, at which point the chain breaks. */
+  combo: { count: number; multiplier: number; timer01: number };
+  /** Salvage currency collected (shown as a small counter). */
+  scrap: number;
+  /** Missile ammunition. */
+  missiles: number;
+  missileMax: number;
+  /** Screen-space reticles (auto-aim target, missile lock, caches). May be empty. */
+  targets: HudTargetMarker[];
+  /** Optional objectives shown under the main objective (max 3). */
+  sideObjectives: SideObjective[];
+  /** Non-null while mode === 'upgrade': the player must pick one option. */
+  upgrade: { title: string; subtitle: string; options: UpgradeOption[] } | null;
+  /** Final stats, shown on the complete/failed screens. rank is 'S' | 'A' | 'B' | 'C' | 'D'. */
+  stats: { kills: number; timeSec: number; damageTaken: number; score: number; bestCombo: number; scrap: number; rank: string };
 };
 
 export type MinimapWorld = {
@@ -151,9 +222,11 @@ export type TouchIntents = {
   fire: boolean;
   boost: boolean;
   handbrake: boolean;
+  /** Secondary weapon (guided missile), edge-triggered by the game. */
+  missile: boolean;
 };
 
-export type HudEvent = 'start' | 'resume' | 'retry' | 'restart' | 'pauseToggle' | 'muteToggle';
+export type HudEvent = 'start' | 'resume' | 'retry' | 'restart' | 'pauseToggle' | 'muteToggle' | 'continue';
 
 export interface GameHud {
   /** Live touch-control state, mutated in place by the HUD's pointer handlers. */
@@ -169,6 +242,10 @@ export interface GameHud {
   /** Directional damage indicator. angleRad is relative to the player's facing: 0 = from ahead, +PI/2 = from the right. */
   flashDamage(angleRad: number, strength01: number): void;
   hitMarker(kill: boolean): void;
+  /** Floating score/style callout near the centre, e.g. scorePopup('DRIFT', 250, 'style'). */
+  scorePopup(label: string, value: number, kind: 'kill' | 'style' | 'pickup' | 'bonus'): void;
+  /** Called with the chosen UpgradeOption.id when the player picks a card in 'upgrade' mode (click, tap, or keys 1-3). */
+  onUpgradePick(handler: (id: string) => void): void;
   setMuted(muted: boolean): void;
   /** Loading progress 0..1 shown in 'loading' mode. */
   setLoadingProgress(value01: number): void;
@@ -177,3 +254,14 @@ export interface GameHud {
   setReducedMotion(enabled: boolean): void;
   dispose(): void;
 }
+
+// ---------------------------------------------------------------- set dressing
+
+/** Extra world detail built by src/world/SetDressing.ts (purely visual plus a few solid props). */
+export type SetDressing = {
+  group: THREE.Group;
+  /** Axis-aligned boxes the game should add to its static colliders. */
+  colliders: { minX: number; maxX: number; minZ: number; maxZ: number }[];
+  update(time: number, cameraPosition: THREE.Vector3, dt: number): void;
+  dispose(): void;
+};
