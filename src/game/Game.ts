@@ -151,6 +151,12 @@ export class Game {
     this.grid = new ColliderGrid(this.layout.colliders);
     this.world = buildCity(this.layout);
     this.scene.add(this.world.group);
+    if (this.lowSpec) {
+      // small repeated props are the bulk of the shadow pass; towers and wrecks keep theirs
+      for (const child of this.world.group.children) {
+        if (/^(rubble|lamps|barrels|barriers)/.test(child.name)) child.castShadow = false;
+      }
+    }
     this.relay = buildRelayTower(this.layout.relay);
     this.scene.add(this.relay.group);
     this.atmosphere = new Atmosphere(this.scene, this.renderer, this.lowSpec);
