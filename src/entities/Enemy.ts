@@ -21,7 +21,13 @@ export interface EnemyHost {
   enemyShot(enemy: Enemy, muzzle: THREE.Object3D, tx: number, ty: number, tz: number, spread: number, damage: number): void;
   mortar(enemy: Enemy, tx: number, tz: number, delay: number): void;
   telegraphSound(enemy: Enemy): void;
+  /** An idle patrol/guard has just noticed the player. */
+  alerted(enemy: Enemy): void;
 }
+
+/** hunt = chase the player; patrol = drive a street loop until alerted; guard = parked until alerted. */
+export type EnemyMode = 'hunt' | 'patrol' | 'guard';
+export const AGGRO = { patrol: 90, guard: 70, blind: 24, cruise: 16 } as const;
 
 const _muzzle = new THREE.Vector3();
 
@@ -51,11 +57,21 @@ export class Enemy {
   enraged = false;
   /** Seconds until this enemy can deal or take ram damage again. */
   ramCooldown = 0;
+  mode: EnemyMode = 'hunt';
+  /** False while a patrol/guard has not noticed the player yet. */
+  aware = true;
+  /** Enemies sharing a squad id are alerted together (0 = none). */
+  squad = 0;
+  /** What landed the most recent damage (kill attribution for style bonuses). */
+  lastHit: 'cannon' | 'missile' | 'ram' | 'barrel' | 'mortar' | 'other' = 'other';
+  lastHitRange = 0;
+  private route: { x: number; z: number }[] | null = null;
+  private routeIndex = 0;
 
-  constructor(readonly kind: EnemyKind, variant: number, flankSide: number, cooldownOffset: number) {
+  constructor(readonly kind: EnemyKind, variant: number, flankSide: number, cooldownOffset: number, healthScale = 1) {
     const model = kind === 'rig' ? createWarRig() : createRaiderBuggy(variant);
     this.vehicle = new Vehicle(model, TUNING[kind]);
-    this.maxHealth = HEALTH[kind];
+    this.maxHealth = Math.round(HEALTH[kind] * healthScale);
     this.health = this.maxHealth;
     this.hitRadius = kind === 'rig' ? model.halfExtents.x * 1.25 : Math.max(model.halfExtents.x * 1.3, 1.5);
     this.bodyRadius = kind === 'rig' ? model.halfExtents.x * 1.5 : model.halfExtents.x * 1.25;
@@ -67,6 +83,26 @@ export class Enemy {
   holdFire(seconds: number): void {
     this.fireCooldown = Math.max(this.fireCooldown, seconds);
     this.mortarCooldown = Math.max(this.mortarCooldown, seconds + 1.5);
+  }
+
+  /** Drive a loop of street junctions until the player is spotted. */
+  setPatrol(route: { x: number; z: number }[], startIndex: number): void {
+    this.mode = 'patrol';
+    this.aware = false;
+    this.route = route;
+    this.routeIndex = startIndex % route.length;
+  }
+
+  /** Sit parked until the player comes close. */
+  setGuard(): void {
+    this.mode = 'guard';
+    this.aware = false;
+  }
+
+  alert(): void {
+    if (this.aware) return;
+    this.aware = true;
+    this.fireCooldown = Math.max(this.fireCooldown, 1.1);
   }
 
   /** Circles along the hull used for bullet hits (longer for the rig). */
@@ -99,10 +135,34 @@ export class Enemy {
     const dist = Math.hypot(dx, dz);
     const sight = host.grid.lineOfSight(v.x, v.z, p.x, p.z);
 
+    if (!this.aware) {
+      const range = this.mode === 'guard' ? AGGRO.guard : AGGRO.patrol;
+      if ((dist < range && sight) || dist < AGGRO.blind) host.alerted(this);
+    }
+    if (!this.aware && (this.mode === 'guard' || !this.route)) {
+      // parked: engine idling, lights low
+      c.throttle = 0;
+      c.steer = 0;
+      c.boost = false;
+      c.handbrake = true;
+      this.telegraph = 0;
+      v.model.accentMaterial.emissiveIntensity = 0.7;
+      return;
+    }
+
     // ---- choose a point to drive at
     let tx = p.x;
     let tz = p.z;
-    if (sight) {
+    const idle = !this.aware;
+    if (idle && this.route) {
+      let wp = this.route[this.routeIndex];
+      if (Math.hypot(wp.x - v.x, wp.z - v.z) < 15) {
+        this.routeIndex = (this.routeIndex + 1) % this.route.length;
+        wp = this.route[this.routeIndex];
+      }
+      tx = wp.x;
+      tz = wp.z;
+    } else if (sight) {
       const lead = Math.min(1.2, dist / 55);
       tx = p.x + p.vx * lead;
       tz = p.z + p.vz * lead;
@@ -144,6 +204,13 @@ export class Enemy {
       throttle = 0.2;
       handbrake = true;
     }
+    if (idle) {
+      // patrol pace: unhurried, slowing for junction turns
+      const cruise = Math.abs(diff) > 0.5 ? AGGRO.cruise * 0.6 : AGGRO.cruise;
+      if (v.forwardSpeed > cruise) throttle = Math.min(throttle, v.forwardSpeed > cruise + 4 ? -0.4 : 0);
+      else throttle = Math.min(throttle, 0.6);
+      handbrake = false;
+    }
     if (this.kind === 'gunner' && sight && dist < 26 && Math.abs(diff) < 0.6) throttle = Math.min(throttle, 0.45);
     if (this.kind === 'rig' && sight && dist < 20 && v.forwardSpeed > 12 && Math.abs(diff) > 0.7) throttle = 0.3;
 
@@ -166,9 +233,15 @@ export class Enemy {
       // heading increases when steer is negative
       c.steer = Math.max(-1, Math.min(1, -diff * 2.4));
       c.handbrake = handbrake;
-      const charging = this.kind === 'rammer' && sight && dist < 55 && Math.abs(diff) < 0.3;
+      const charging = !idle && this.kind === 'rammer' && sight && dist < 55 && Math.abs(diff) < 0.3;
       c.boost = charging;
       if (this.kind === 'rammer') this.telegraph += ((charging ? 1 : 0) - this.telegraph) * Math.min(1, dt * 6);
+    }
+
+    if (idle) {
+      this.telegraph = 0;
+      v.model.accentMaterial.emissiveIntensity = 1.1;
+      return;
     }
 
     // ---- weapons

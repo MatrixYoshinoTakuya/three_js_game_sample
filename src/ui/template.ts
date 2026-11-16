@@ -1,3 +1,5 @@
+import type { UpgradeOption } from '../game/contracts';
+
 /**
  * Static HUD markup. Built once by Hud.ts; every dynamic node carries a
  * `data-ref` so the Hud can cache direct element references.
@@ -59,6 +61,26 @@ const ICON_THREAT = `<svg class="ico-s" viewBox="0 0 16 16" aria-hidden="true"><
 
 const ICON_BOLT = `<svg class="ico-s" viewBox="0 0 12 12" aria-hidden="true"><path d="M7.2 0.6L2.2 6.8h3L4.4 11.4l5.4-6.6H6.6z" fill="currentColor"/></svg>`;
 
+const ICON_SCRAP = `<svg class="ico-s" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 .7l4.6 2.65v5.3L6 11.3 1.4 8.65v-5.3z" fill="currentColor"/><circle cx="6" cy="6" r="1.9" fill="#140b08"/></svg>`;
+
+const ICON_WARN = `<svg class="ico-s" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 .8l5.4 10H.6z" fill="currentColor"/><path d="M6 4.4v3.2M6 8.6v1.2" stroke="#140b08" stroke-width="1.3"/></svg>`;
+
+const ICON_ROCKET = `<svg viewBox="0 0 8 14" aria-hidden="true"><path d="M4 1C5.9 3 6.5 5 6.5 7v3.5l1 2.5h-7l1-2.5V7C1.5 5 2.1 3 4 1z"/></svg>`;
+
+const ICON_ROCKET_BTN = `<svg viewBox="0 0 40 40" aria-hidden="true"><g transform="rotate(45 20 20)"><path d="M20 4c4 4.5 5 9 5 13v9H15v-9c0-4 1-8.5 5-13zM15 21l-5 8h5M25 21l5 8h-5M18 30v4M22 30v4"/></g></svg>`;
+
+/** Upgrade card glyphs, 48 x 48 line art drawn with currentColor. */
+export const UPGRADE_ICONS: Record<UpgradeOption['icon'], string> = {
+  cannon: `<svg viewBox="0 0 48 48" aria-hidden="true"><path d="M5 17h11v14H5zM16 20h20v8H16zM36 18h7v12h-7z"/><path class="g-fill" d="M20 22.5h12v3H20z"/><path d="M9 31v6M5 37h8M39 22v4"/></svg>`,
+  armor: `<svg viewBox="0 0 48 48" aria-hidden="true"><path d="M24 4l16 6v13c0 10-7 17-16 21C15 40 8 33 8 23V10z"/><path d="M16 21l8 7 8-7M16 14h16"/><path class="g-fill" d="M22.5 31h3v6h-3z"/></svg>`,
+  boost: `<svg viewBox="0 0 48 48" aria-hidden="true"><path class="g-fill" d="M28 3L11 27h10l-3 18 19-25H26z"/><path d="M5 12l5 6-5 6M38 30l5 6-5 6"/></svg>`,
+  missile: `<svg viewBox="0 0 48 48" aria-hidden="true"><g transform="rotate(45 24 24)"><path d="M24 2c5 5.5 6.5 11 6.5 16v13h-13V18c0-5 1.5-10.5 6.5-16z"/><path d="M17.5 24l-7 10h7M30.5 24l7 10h-7"/><path class="g-fill" d="M21.5 13h5v5h-5z"/><path d="M21 35v6M27 35v6M24 35v9"/></g></svg>`,
+  cooling: `<svg viewBox="0 0 48 48" aria-hidden="true"><path d="M24 4v40M6.7 14l34.6 20M6.7 34l34.6-20"/><path d="M19 7l5 5 5-5M19 41l5-5 5 5M6.5 21.5l6.8-1.8-1.8-6.8M41.5 26.5l-6.8 1.8 1.8 6.8M6.5 26.5l6.8 1.8-1.8 6.8M41.5 21.5l-6.8-1.8 1.8-6.8"/><circle class="g-fill" cx="24" cy="24" r="3.2"/></svg>`,
+  ram: `<svg viewBox="0 0 48 48" aria-hidden="true"><path d="M4 30L24 9l20 21"/><path class="g-fill" d="M10 34L24 19l14 15z"/><path d="M4 40h40M12 34v6M36 34v6M24 3v6"/></svg>`,
+  magnet: `<svg viewBox="0 0 48 48" aria-hidden="true"><path d="M10 6h10v19a4 4 0 0 0 8 0V6h10v19a14 14 0 0 1-28 0z"/><path class="g-fill" d="M10 6h10v7H10zM28 6h10v7H28z"/><path d="M4 38l4-2M44 38l-4-2M24 44v-3"/></svg>`,
+  repair: `<svg viewBox="0 0 48 48" aria-hidden="true"><path d="M24 4l17.3 10v20L24 44 6.7 34V14z"/><path class="g-fill" d="M21 14h6v7h7v6h-7v7h-6v-7h-7v-6h7z"/></svg>`,
+};
+
 /** Ruined-skyline mark used on loading/title. */
 const MARK = `<svg class="mark" viewBox="0 0 120 64" aria-hidden="true"><path d="M2 62h116" stroke="currentColor" stroke-width="1"/><path d="M8 62V34l6-4v32M20 62V22h9l3 5v35M38 62V40h8v22M50 62V8l4-5 4 5v10h5v44M68 62V28l8-6v40M82 62V38h7v-9l5 3v30M100 62V44h9v18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="miter"/><path d="M54 3v-3M46 12h16" stroke="var(--teal)" stroke-width="1.4"/><circle cx="54" cy="12" r="2.2" fill="var(--teal)"/></svg>`;
 
@@ -75,27 +97,80 @@ function legend(): string {
       ${row(['W', 'S', '↑', '↓'], 'アクセル / ブレーキ')}
       ${row(['A', 'D', '←', '→'], 'ステアリング')}
       ${row(['SPACE'], '機関砲')}
+      ${row(['E'], 'ミサイル')}
       ${row(['SHIFT'], 'ブースト')}
       ${row(['X'], 'ハンドブレーキ')}
+      ${row(['1', '2', '3'], '強化選択')}
       ${row(['ESC', 'P'], 'ポーズ')}
       ${row(['M'], 'ミュート')}
     </ul>
     <ul class="legend-touch">
       <li><span class="lg-keys"><kbd>STICK</kbd></span><span class="lg-label">操舵・アクセル</span></li>
       <li><span class="lg-keys"><kbd>FIRE</kbd></span><span class="lg-label">機関砲</span></li>
+      <li><span class="lg-keys"><kbd>MISSILE</kbd></span><span class="lg-label">ミサイル</span></li>
       <li><span class="lg-keys"><kbd>BOOST</kbd></span><span class="lg-label">ブースト</span></li>
       <li><span class="lg-keys"><kbd>DRIFT</kbd></span><span class="lg-label">ハンドブレーキ</span></li>
     </ul>
   </div>`;
 }
 
-function stats(prefix: string): string {
-  return `<dl class="stats">
-    <div><dt>撃破<em>KILLS</em></dt><dd data-ref="${prefix}Kills">0</dd></div>
-    <div><dt>走行時間<em>TIME</em></dt><dd data-ref="${prefix}Time">00:00</dd></div>
-    <div><dt>被ダメージ<em>DAMAGE</em></dt><dd data-ref="${prefix}Damage">0</dd></div>
-  </dl>`;
+function results(prefix: string): string {
+  return `<div class="rs">
+    <div class="rank" data-ref="${prefix}Rank" data-rank="D"><span>RANK</span><b data-ref="${prefix}RankLetter">D</b></div>
+    <div class="rs-score"><span class="rs-label">スコア<em>SCORE</em></span><b data-ref="${prefix}Score">0</b></div>
+    <dl class="stats">
+      <div><dt>最大コンボ<em>BEST COMBO</em></dt><dd data-ref="${prefix}Combo">0</dd></div>
+      <div><dt>撃破<em>KILLS</em></dt><dd data-ref="${prefix}Kills">0</dd></div>
+      <div><dt>スクラップ<em>SCRAP</em></dt><dd data-ref="${prefix}Scrap">0</dd></div>
+      <div><dt>走行時間<em>TIME</em></dt><dd data-ref="${prefix}Time">00:00</dd></div>
+      <div><dt>被ダメージ<em>DAMAGE</em></dt><dd data-ref="${prefix}Damage">0</dd></div>
+    </dl>
+  </div>`;
 }
+
+function sideRows(): string {
+  let out = '';
+  for (let i = 0; i < 3; i += 1) {
+    out += `<li hidden><i class="so-box"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 6.2l2.4 2.4 4.6-5.2"/></svg></i><span class="so-label"></span><b class="so-dist"></b></li>`;
+  }
+  return out;
+}
+
+function missilePips(): string {
+  let out = '';
+  for (let i = 0; i < 6; i += 1) out += `<i class="ms-pip">${ICON_ROCKET}</i>`;
+  return out;
+}
+
+function popups(): string {
+  let out = '';
+  for (let i = 0; i < 5; i += 1) out += `<div class="pop" style="--i:${i}"><span></span><b></b></div>`;
+  return out;
+}
+
+function upgradeCards(): string {
+  let out = '';
+  for (let i = 0; i < 3; i += 1) {
+    out += `<button type="button" class="up-card" data-up="${i}">
+      <kbd class="up-key">${i + 1}</kbd>
+      <span class="up-icon"></span>
+      <span class="up-name"></span>
+      <span class="up-desc"></span>
+      <span class="up-level"><b class="up-lv"></b><span class="up-pips"><i></i><i></i><i></i><i></i><i></i></span></span>
+    </button>`;
+  }
+  return out;
+}
+
+/** Cloned by Hud.ts whenever the reticle pool has to grow. */
+const TARGET_TEMPLATE = `<div class="tg">
+  <svg class="tg-g tg-aim" viewBox="-30 -30 60 60"><path class="tg-shadow" d="M-22 -12v-10h10M12 -22h10v10M22 12v10h-10M-12 22h-10v-10"/><path d="M-22 -12v-10h10M12 -22h10v10M22 12v10h-10M-12 22h-10v-10"/><path class="tg-arc-bg" d="M-18 25q18 7 36 0"/><path class="tg-arc" d="M-18 25q18 7 36 0" pathLength="100"/></svg>
+  <div class="tg-g tg-ring"><svg viewBox="-30 -30 60 60"><path class="tg-shadow" d="M0 -24L24 0 0 24 -24 0z"/><path class="tg-ring-bg" d="M0 -24L24 0 0 24 -24 0z"/><path class="tg-prog" d="M0 -24L24 0 0 24 -24 0z" pathLength="100"/></svg></div>
+  <svg class="tg-g tg-locking-dot" viewBox="-30 -30 60 60"><path d="M0 -5L5 0 0 5 -5 0z"/></svg>
+  <svg class="tg-g tg-locked" viewBox="-30 -30 60 60"><path class="tg-shadow" d="M0 -22L22 0 0 22 -22 0z"/><path class="tg-locked-box" d="M0 -22L22 0 0 22 -22 0z"/><path class="tg-locked-core" d="M0 -8L8 0 0 8 -8 0z"/><path d="M0 -29v9M29 0h-9M0 29v-9M-29 0h9"/></svg>
+  <svg class="tg-g tg-cache" viewBox="-30 -30 60 60"><path class="tg-shadow" d="M0 -17l14.7 8.5v17L0 17l-14.7-8.5v-17z"/><path d="M0 -17l14.7 8.5v17L0 17l-14.7-8.5v-17z"/><path class="tg-cache-core" d="M-6 -2.5h12v7h-12zM-6 -2.5l2.5 -3h7l2.5 3"/></svg>
+  <span class="tg-tag"><b>LOCK</b><i></i></span>
+</div>`;
 
 export function buildHudMarkup(): string {
   const gaugeEnd = GAUGE_START + GAUGE_SWEEP;
@@ -111,6 +186,7 @@ export function buildHudMarkup(): string {
     <div class="hud-dmg" data-ref="dmg0"><svg viewBox="0 0 200 200"><path d="M52 36A80 80 0 0 1 148 36"/><path class="dmg-tip" d="M100 4l7 12h-14z"/></svg></div>
     <div class="hud-dmg" data-ref="dmg1"><svg viewBox="0 0 200 200"><path d="M52 36A80 80 0 0 1 148 36"/><path class="dmg-tip" d="M100 4l7 12h-14z"/></svg></div>
     <div class="hud-dmg" data-ref="dmg2"><svg viewBox="0 0 200 200"><path d="M52 36A80 80 0 0 1 148 36"/><path class="dmg-tip" d="M100 4l7 12h-14z"/></svg></div>
+    <div class="hud-crit"></div>
     <div class="hud-hit" data-ref="hit"><svg viewBox="0 0 40 40"><path d="M7 7l8 8M33 7l-8 8M7 33l8-8M33 33l-8-8"/></svg></div>
   </div>
 
@@ -118,29 +194,56 @@ export function buildHudMarkup(): string {
   <div class="hud-bar hud-bar--bottom" aria-hidden="true"></div>
 
   <div class="hud-play">
+    <div class="hud-targets" data-ref="targets" aria-hidden="true"></div>
+    <template data-ref="tgTpl">${TARGET_TEMPLATE}</template>
+    <div class="hud-pops" data-ref="pops" aria-hidden="true">${popups()}</div>
+
     <div class="hud-col">
       <div class="hud-obj" data-ref="obj" aria-live="polite">
         <div class="obj-label">${ICON_DIAMOND}<span>目標</span><em>OBJECTIVE</em></div>
         <div class="obj-title" data-ref="objTitle"></div>
         <div class="obj-meta"><span class="obj-detail" data-ref="objDetail"></span><span class="obj-dist" data-ref="objDist"></span></div>
       </div>
-      <div class="hud-chip" data-ref="chip">${ICON_THREAT}<span>敵影</span><b data-ref="chipNum">×0</b></div>
+      <ul class="obj-side" data-ref="side" aria-label="サブ目標">${sideRows()}</ul>
+      <div class="hud-rt">
+        <div class="hud-score">
+          <div class="sc-label"><span>スコア</span><em>SCORE</em></div>
+          <div class="sc-num" data-ref="score">0</div>
+          <div class="sc-scrap">${ICON_SCRAP}<b data-ref="scrap">0</b><em>SCRAP</em></div>
+        </div>
+        <div class="hud-chip" data-ref="chip">${ICON_THREAT}<span>敵影</span><b data-ref="chipNum">×0</b></div>
+        <div class="hud-combo" data-ref="combo">
+          <b class="cb-mult" data-ref="comboMult">×1</b>
+          <div class="cb-body">
+            <div class="cb-count"><b data-ref="comboCount">0</b><em>CHAIN</em></div>
+            <div class="cb-bar"><i data-ref="comboBar"></i></div>
+          </div>
+        </div>
+      </div>
       <div class="hud-minimap">
         <canvas data-ref="map" width="168" height="168"></canvas>
         <svg class="mm-rim" viewBox="0 0 100 100" aria-hidden="true"><circle cx="50" cy="50" r="49" /><path d="M50 0v5M100 50h-5M50 100v-5M0 50h5"/></svg>
         <span class="mm-range">220M</span>
       </div>
       <div class="hud-vitals">
-        <div class="vt-row vt-armor" data-ref="armorRow">
-          <span class="vt-label">ARMOR<small>装甲</small></span>
-          <div class="vt-bar vt-bar--seg"><i data-ref="armorFill"></i></div>
-          <span class="vt-num" data-ref="armorNum">100</span>
+        <div class="vt-panel">
+          <div class="vt-row vt-armor" data-ref="armorRow">
+            <span class="vt-label">ARMOR<small>装甲</small></span>
+            <div class="vt-bar vt-bar--seg"><i data-ref="armorFill"></i></div>
+            <span class="vt-num" data-ref="armorNum">100</span>
+          </div>
+          <div class="vt-row vt-heat" data-ref="heatRow">
+            <span class="vt-label">HEAT<small>砲身</small></span>
+            <div class="vt-bar"><i data-ref="heatFill"></i></div>
+            <span class="vt-state">OVERHEAT</span>
+          </div>
+          <div class="vt-row vt-msl" data-ref="mslRow">
+            <span class="vt-label">MSL<small>誘導弾</small></span>
+            <div class="ms-pips" data-ref="mslPips">${missilePips()}</div>
+            <span class="ms-end"><kbd>E</kbd><em>EMPTY</em></span>
+          </div>
         </div>
-        <div class="vt-row vt-heat" data-ref="heatRow">
-          <span class="vt-label">HEAT<small>砲身</small></span>
-          <div class="vt-bar"><i data-ref="heatFill"></i></div>
-          <span class="vt-state">OVERHEAT</span>
-        </div>
+        <div class="vt-crit">${ICON_WARN}<span>ARMOR CRITICAL</span></div>
       </div>
     </div>
 
@@ -191,6 +294,7 @@ export function buildHudMarkup(): string {
       <div class="tc-knob" data-ref="knob"></div>
     </div>
     <button type="button" tabindex="-1" class="tc-btn tc-drift" data-touch="handbrake" aria-label="ハンドブレーキ"><span>DRIFT</span></button>
+    <button type="button" tabindex="-1" class="tc-btn tc-missile" data-touch="missile" aria-label="ミサイル">${ICON_ROCKET_BTN}<span>MISSILE</span></button>
     <button type="button" tabindex="-1" class="tc-btn tc-boost" data-touch="boost" aria-label="ブースト">${ICON_BOLT}<span>BOOST</span></button>
     <button type="button" tabindex="-1" class="tc-btn tc-fire" data-touch="fire" aria-label="機関砲"><svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="11"/><path d="M20 3v10M20 27v10M3 20h10M27 20h10"/></svg><span>FIRE</span></button>
   </div>
@@ -230,12 +334,24 @@ export function buildHudMarkup(): string {
     </div>
   </section>
 
+  <section class="hud-screen hud-upgrade" aria-label="強化選択">
+    <div class="up-inner">
+      <div class="up-head">
+        <div class="up-kicker"><span>強化選択</span><em>FIELD UPGRADE</em></div>
+        <h2 class="up-title" data-ref="upTitle"></h2>
+        <p class="up-sub" data-ref="upSub"></p>
+      </div>
+      <div class="up-cards" data-ref="upCards">${upgradeCards()}</div>
+      <div class="up-hint"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><span>で即決</span><i></i><kbd>←</kbd><kbd>→</kbd><kbd>ENTER</kbd><span>で選択</span></div>
+    </div>
+  </section>
+
   <section class="hud-screen hud-failed" aria-label="車両大破">
     <div class="result">
       <div class="result-kicker">SIGNAL LOST</div>
       <h2 class="result-title">車両大破</h2>
       <div class="result-sub">WRECKED</div>
-      ${stats('fail')}
+      ${results('fail')}
       <div class="result-actions">
         <button type="button" class="btn btn--primary" data-act="retry"><span>リトライ</span><small>チェックポイントから</small></button>
         <button type="button" class="btn" data-act="restart"><span>最初から</span></button>
@@ -248,10 +364,11 @@ export function buildHudMarkup(): string {
       <div class="result-kicker">RELAY ONLINE</div>
       <h2 class="result-title">MISSION COMPLETE</h2>
       <div class="result-sub">第7中継塔 確保</div>
-      ${stats('done')}
+      ${results('done')}
       <p class="result-chapter">CHAPTER 1 完 — TO BE CONTINUED</p>
       <div class="result-actions">
         <button type="button" class="btn btn--primary" data-act="restart"><span>もう一度走る</span></button>
+        <button type="button" class="btn" data-act="continue"><span>フリーローム続行</span></button>
       </div>
     </div>
   </section>

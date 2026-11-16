@@ -5,11 +5,13 @@ import type { VehicleModel } from '../../game/contracts';
 /**
  * ASHEN SKYLINE vehicle kit.
  *
- * Every vehicle is authored from extrusions, lofted plates, tubes and lathes,
- * then merged BY MATERIAL into a handful of meshes. Static geometry is built
- * once per vehicle type (blueprint cache) and shared by all instances; only
- * the materials the game mutates (paint, head/tail lights, accent) are
- * per-instance.
+ * Bodies are lofted from cross-section ribs (custom BufferGeometry with
+ * crease-aware smooth normals); everything bolted on is authored from tubes,
+ * plates, lathes and extrusions, then merged BY MATERIAL into a handful of
+ * meshes. Static geometry is built once per vehicle type (blueprint cache)
+ * and shared by all instances; only the materials the game mutates (paint,
+ * head/tail lights, accent) are per-instance. Textures (6 in total, all
+ * procedural, <= 1024 px) are generated lazily once and shared.
  *
  * Conventions: metres, Y up, origin on the ground under the vehicle centre,
  * forward = +Z, left = +X. Sockets (muzzles, exhausts) have local +Z pointing
@@ -28,6 +30,7 @@ type Look = { c: number; r: number; m: number; j: number };
 const v = (x: number, y: number, z: number): V3 => new THREE.Vector3(x, y, z);
 const look = (c: number, r: number, m: number, j = 0): Look => ({ c, r, m, j });
 const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
+const clamp01 = (x: number): number => Math.min(1, Math.max(0, x));
 const sm = (e0: number, e1: number, x: number): number => {
   const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
   return t * t * (3 - 2 * t);
@@ -44,7 +47,52 @@ function rng(seed: number): () => number {
   };
 }
 
+/** Deterministic 0..1 hash of a position (welded corners get the same value). */
+const hash3 = (x: number, y: number, z: number, seed = 0): number => {
+  const h = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719 + seed * 4.1) * 43758.5453;
+  return h - Math.floor(h);
+};
+
+/** Piecewise-linear 1D curve through (x, y) keys. */
+function lin(keys: readonly P2[]): (x: number) => number {
+  return (x) => {
+    if (x <= keys[0][0]) return keys[0][1];
+    for (let i = 1; i < keys.length; i++) {
+      if (x <= keys[i][0]) return lerp(keys[i - 1][1], keys[i][1], (x - keys[i - 1][0]) / (keys[i][0] - keys[i - 1][0]));
+    }
+    return keys[keys.length - 1][1];
+  };
+}
+
+/** Smooth (Catmull-Rom style Hermite) 1D curve through (x, y) keys. */
+function curve1(keys: readonly P2[]): (x: number) => number {
+  const n = keys.length;
+  const tan: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const a = keys[Math.max(0, i - 1)];
+    const b = keys[Math.min(n - 1, i + 1)];
+    tan.push((b[1] - a[1]) / (b[0] - a[0]));
+  }
+  return (x) => {
+    if (x <= keys[0][0]) return keys[0][1];
+    if (x >= keys[n - 1][0]) return keys[n - 1][1];
+    let i = 1;
+    while (x > keys[i][0]) i++;
+    const h = keys[i][0] - keys[i - 1][0];
+    const t = (x - keys[i - 1][0]) / h;
+    const t2 = t * t;
+    const t3 = t2 * t;
+    return (
+      (2 * t3 - 3 * t2 + 1) * keys[i - 1][1] +
+      (t3 - 2 * t2 + t) * h * tan[i - 1] +
+      (-2 * t3 + 3 * t2) * keys[i][1] +
+      (t3 - t2) * h * tan[i]
+    );
+  };
+}
+
 const MIRROR_X = new THREE.Matrix4().makeScale(-1, 1, 1);
+const AXIS_X = new THREE.Vector3(1, 0, 0);
 const AXIS_Y = new THREE.Vector3(0, 1, 0);
 const AXIS_Z = new THREE.Vector3(0, 0, 1);
 
@@ -65,6 +113,82 @@ function posAttr(geo: THREE.BufferGeometry): THREE.BufferAttribute {
 
 function triangleCount(geo: THREE.BufferGeometry): number {
   return (geo.index ? geo.index.count : posAttr(geo).count) / 3;
+}
+
+// ---------------------------------------------------------------- real-GPU safety
+
+type SanitizeEntry = { label: string; triangles: number; droppedTriangles: number; fixedNormals: number };
+const sanitizeLog: SanitizeEntry[] = [];
+
+/**
+ * Drops degenerate / non-finite triangles and repairs any normal that is NaN
+ * or shorter than 0.5 (replaced by the face normal). A zero-length normal
+ * turns into NaN after normalize() on real GPUs and poisons the HDR chain.
+ */
+function sanitize(geoIn: THREE.BufferGeometry, label: string): THREE.BufferGeometry {
+  const g = geoIn.index ? geoIn.toNonIndexed() : geoIn;
+  if (!g.getAttribute('normal')) g.computeVertexNormals();
+  const pos = posAttr(g);
+  const nor = g.getAttribute('normal') as THREE.BufferAttribute;
+  const pa = pos.array as Float32Array;
+  const na = nor.array as Float32Array;
+  const count = pos.count - (pos.count % 3);
+  const keep: number[] = [];
+  let dropped = 0;
+  let fixed = 0;
+  for (let t = 0; t < count; t += 3) {
+    const o = t * 3;
+    let finite = true;
+    for (let k = 0; k < 9; k++) if (!Number.isFinite(pa[o + k])) finite = false;
+    const ux = pa[o + 3] - pa[o];
+    const uy = pa[o + 4] - pa[o + 1];
+    const uz = pa[o + 5] - pa[o + 2];
+    const wx = pa[o + 6] - pa[o];
+    const wy = pa[o + 7] - pa[o + 1];
+    const wz = pa[o + 8] - pa[o + 2];
+    let fx = uy * wz - uz * wy;
+    let fy = uz * wx - ux * wz;
+    let fz = ux * wy - uy * wx;
+    const fl = Math.hypot(fx, fy, fz);
+    if (!finite || !(fl > 1e-8)) {
+      dropped++;
+      continue;
+    }
+    fx /= fl;
+    fy /= fl;
+    fz /= fl;
+    for (let k = 0; k < 3; k++) {
+      const i = o + k * 3;
+      const l = Math.hypot(na[i], na[i + 1], na[i + 2]);
+      if (!(l > 0.5)) {
+        na[i] = fx;
+        na[i + 1] = fy;
+        na[i + 2] = fz;
+        fixed++;
+      } else if (Math.abs(l - 1) > 1e-4) {
+        na[i] /= l;
+        na[i + 1] /= l;
+        na[i + 2] /= l;
+      }
+    }
+    keep.push(t);
+  }
+  if (dropped > 0 || count !== pos.count) {
+    for (const name of Object.keys(g.attributes)) {
+      const attr = g.getAttribute(name) as THREE.BufferAttribute;
+      const size = attr.itemSize;
+      const src = attr.array as Float32Array;
+      const dst = new Float32Array(keep.length * 3 * size);
+      keep.forEach((t, n) => {
+        for (let k = 0; k < 3 * size; k++) dst[n * 3 * size + k] = src[t * size + k];
+      });
+      g.setAttribute(name, new THREE.BufferAttribute(dst, size));
+    }
+  }
+  sanitizeLog.push({ label, triangles: keep.length, droppedTriangles: dropped, fixedNormals: fixed });
+  g.computeBoundingBox();
+  g.computeBoundingSphere();
+  return g;
 }
 
 // ---------------------------------------------------------------- palette
@@ -94,6 +218,8 @@ const C = {
   rigIronLight: 0x453c36,
   rigOxide: 0x57291b,
   dust: 0x94704c,
+  mud: 0x4d3a28,
+  soot: 0x0d0b0a,
 } as const;
 
 const L = {
@@ -113,15 +239,102 @@ const L = {
   canRed: look(0x7c2a16, 0.65, 0.25, 0.05),
   frame: look(0x352720, 0.7, 0.6, 0.1),
   lens: look(0xffffff, 0.3, 0, 0),
+  lensOff: look(0x2b2b2b, 0.3, 0, 0),
+  weld: look(0x4c4a52, 0.42, 0.9, 0.12),
+  leather: look(0x1c1612, 0.8, 0, 0.08),
+  hazard: look(C.hazard, 0.7, 0.2, 0.1),
+  mud: look(C.mud, 1, 0, 0.12),
 } as const;
 
 /** Look for buckets whose material ignores the PBR palette (paint, lights). */
 const paint = (c: number, j = 0.05): Look => look(c, 0.5, 0.5, j);
 
-// ---------------------------------------------------------------- textures / shared materials
+// ---------------------------------------------------------------- procedural textures (6 total, shared)
+
+let textureCount = 0;
+
+function dataTexture(data: Uint8Array, w: number, h: number, srgb: boolean, repeat: boolean): THREE.DataTexture {
+  const tex = new THREE.DataTexture(data, w, h, THREE.RGBAFormat);
+  tex.wrapS = repeat ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+  tex.wrapT = repeat ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  tex.anisotropy = 8;
+  tex.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+  tex.needsUpdate = true;
+  textureCount++;
+  return tex;
+}
+
+/** Tileable value-noise fbm, S x S, normalised to 0..1. */
+function fbmField(S: number, octaves: readonly P2[], seed: number): Float32Array {
+  const rand = rng(seed);
+  const field = new Float32Array(S * S);
+  let total = 0;
+  for (const [period, amp] of octaves) {
+    total += amp;
+    const lattice = new Float32Array(period * period);
+    for (let i = 0; i < lattice.length; i++) lattice[i] = rand();
+    for (let y = 0; y < S; y++) {
+      const fy = (y / S) * period;
+      const y0 = Math.floor(fy);
+      const ty = sm(0, 1, fy - y0);
+      for (let x = 0; x < S; x++) {
+        const fx = (x / S) * period;
+        const x0 = Math.floor(fx);
+        const tx = sm(0, 1, fx - x0);
+        const a = lattice[(y0 % period) * period + (x0 % period)];
+        const b = lattice[(y0 % period) * period + ((x0 + 1) % period)];
+        const c = lattice[((y0 + 1) % period) * period + (x0 % period)];
+        const d = lattice[((y0 + 1) % period) * period + ((x0 + 1) % period)];
+        field[y * S + x] += amp * lerp(lerp(a, b, tx), lerp(c, d, tx), ty);
+      }
+    }
+  }
+  for (let i = 0; i < field.length; i++) field[i] /= total;
+  return field;
+}
+
+/** Bilinear wrapped lookup into an S x S field (coordinates in texels). */
+function fieldAt(f: Float32Array, S: number, x: number, y: number): number {
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const tx = x - x0;
+  const ty = y - y0;
+  const xa = ((x0 % S) + S) % S;
+  const ya = ((y0 % S) + S) % S;
+  const xb = (xa + 1) % S;
+  const yb = (ya + 1) % S;
+  return lerp(lerp(f[ya * S + xa], f[ya * S + xb], tx), lerp(f[yb * S + xa], f[yb * S + xb], tx), ty);
+}
+
+/** Height field -> tangent-space normal map bytes. */
+function heightToNormal(h: Float32Array, W: number, H: number, strength: number, wrap: boolean): Uint8Array {
+  const out = new Uint8Array(W * H * 4);
+  const at = (x: number, y: number): number => {
+    const xi = wrap ? (x + W) % W : Math.min(W - 1, Math.max(0, x));
+    const yi = wrap ? (y + H) % H : Math.min(H - 1, Math.max(0, y));
+    return h[yi * W + xi];
+  };
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const dx = (at(x + 1, y) - at(x - 1, y)) * strength;
+      const dy = (at(x, y + 1) - at(x, y - 1)) * strength;
+      const l = Math.hypot(dx, dy, 1);
+      const i = (y * W + x) * 4;
+      out[i] = Math.round((-dx / l) * 127.5 + 127.5);
+      out[i + 1] = Math.round((-dy / l) * 127.5 + 127.5);
+      out[i + 2] = Math.round((1 / l) * 127.5 + 127.5);
+      out[i + 3] = 255;
+    }
+  }
+  return out;
+}
 
 let paletteTex: THREE.DataTexture | null = null;
-let grimeTex: THREE.DataTexture | null = null;
+let wearTex: THREE.DataTexture | null = null;
+let wearNormalTex: THREE.DataTexture | null = null;
 let kitMat: THREE.MeshStandardMaterial | null = null;
 let glassMat: THREE.MeshPhysicalMaterial | null = null;
 
@@ -144,88 +357,102 @@ function pbrPalette(): THREE.DataTexture {
   tex.minFilter = THREE.LinearFilter;
   tex.generateMipmaps = false;
   tex.needsUpdate = true;
+  textureCount++;
   paletteTex = tex;
   return tex;
 }
 
-/** 256px tileable dust / scratch map, used as both albedo multiplier and roughness variation on paint. */
-function grimeTexture(): THREE.DataTexture {
-  if (grimeTex) return grimeTex;
-  const S = 256;
+/**
+ * 512px tileable wear set for raider / rig paint (linear data):
+ * R = scrape field (bare metal revealed by damage), G = grime (albedo multiplier + roughness),
+ * B = metalness multiplier, A = scorch field. A matching hammered-plate normal map is built alongside.
+ */
+function wearTextures(): { wear: THREE.DataTexture; normal: THREE.DataTexture } {
+  if (wearTex && wearNormalTex) return { wear: wearTex, normal: wearNormalTex };
+  const S = 512;
   const rand = rng(90210);
-  const field = new Float32Array(S * S);
-  const octaves: [number, number][] = [
-    [6, 0.45],
-    [14, 0.27],
-    [32, 0.17],
-    [80, 0.11],
-  ];
-  for (const [period, amp] of octaves) {
-    const lattice = new Float32Array(period * period);
-    for (let i = 0; i < lattice.length; i++) lattice[i] = rand();
-    for (let y = 0; y < S; y++) {
-      const fy = (y / S) * period;
-      const y0 = Math.floor(fy);
-      const ty = sm(0, 1, fy - y0);
-      for (let x = 0; x < S; x++) {
-        const fx = (x / S) * period;
-        const x0 = Math.floor(fx);
-        const tx = sm(0, 1, fx - x0);
-        const a = lattice[(y0 % period) * period + (x0 % period)];
-        const b = lattice[(y0 % period) * period + ((x0 + 1) % period)];
-        const c = lattice[((y0 + 1) % period) * period + (x0 % period)];
-        const d = lattice[((y0 + 1) % period) * period + ((x0 + 1) % period)];
-        field[y * S + x] += amp * lerp(lerp(a, b, tx), lerp(c, d, tx), ty);
-      }
+  const broad = fbmField(S, [[4, 0.5], [9, 0.3], [20, 0.2]], 11);
+  const fine = fbmField(S, [[24, 0.45], [56, 0.35], [128, 0.2]], 12);
+  const streak = fbmField(S, [[6, 0.5], [14, 0.3], [40, 0.2]], 13);
+  const grime = new Float32Array(S * S);
+  const scrape = new Float32Array(S * S);
+  const scorch = new Float32Array(S * S);
+  const height = new Float32Array(S * S);
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const i = y * S + x;
+      const b = broad[i];
+      const f = fine[i];
+      grime[i] = 0.62 + 0.38 * sm(0.2, 0.8, 0.65 * b + 0.35 * f);
+      // long streaky ridges: scrapes run along the travel direction
+      const s = fieldAt(streak, S, x * 0.35, y * 2.2);
+      const ridge = 1 - Math.abs(2 * s - 1);
+      scrape[i] = clamp01(Math.pow(ridge, 5) * 0.8 + 0.3 * f + 0.12 * (1 - b));
+      scorch[i] = clamp01(sm(0.25, 0.75, fieldAt(broad, S, x * 0.5 + 131, y * 0.5 + 57)) * 0.8 + 0.2 * f);
+      // hammered plate: broad dents plus pitting
+      height[i] = 0.9 * b + 0.25 * f - 0.5 * sm(0.72, 0.9, f);
     }
   }
-  for (let i = 0; i < field.length; i++) field[i] = 0.7 + 0.3 * sm(0.25, 0.8, field[i]);
-  // scratches: light scuffs and dark gouges, mostly along the travel direction
-  for (let k = 0; k < 110; k++) {
+  const stroke = (val: number, hgt: number, k: number): void => {
     let x = rand() * S;
     let y = rand() * S;
     const ang = (rand() - 0.5) * 0.7 + (rand() < 0.2 ? Math.PI / 2 : 0);
-    const len = 8 + rand() * 56;
-    const val = rand() < 0.6 ? 1 : 0.52;
+    const len = 14 + rand() * 110;
     const dx = Math.cos(ang);
     const dy = Math.sin(ang);
     for (let t = 0; t < len; t++) {
       const xi = ((Math.floor(x) % S) + S) % S;
       const yi = ((Math.floor(y) % S) + S) % S;
-      field[yi * S + xi] = lerp(field[yi * S + xi], val, 0.75);
+      const i = yi * S + xi;
+      grime[i] = lerp(grime[i], val, k);
+      scrape[i] = Math.max(scrape[i], val > 0.8 ? 0.85 : scrape[i]);
+      height[i] += hgt;
       x += dx;
       y += dy;
     }
-  }
-  for (let k = 0; k < 700; k++) {
+  };
+  for (let k = 0; k < 260; k++) stroke(rand() < 0.6 ? 1 : 0.45, -0.35, 0.7);
+  for (let k = 0; k < 2400; k++) {
     const i = Math.floor(rand() * S * S);
-    field[i] *= 0.7 + rand() * 0.2;
+    grime[i] *= 0.65 + rand() * 0.25;
+    height[i] -= 0.3;
   }
   const data = new Uint8Array(S * S * 4);
   for (let i = 0; i < S * S; i++) {
-    const b = Math.round(Math.min(1, field[i]) * 255);
-    data[i * 4] = b;
-    data[i * 4 + 1] = b;
-    data[i * 4 + 2] = b;
-    data[i * 4 + 3] = 255;
+    data[i * 4] = Math.round(clamp01(scrape[i]) * 255);
+    data[i * 4 + 1] = Math.round(clamp01(grime[i]) * 255);
+    data[i * 4 + 2] = Math.round(clamp01(0.75 + 0.25 * grime[i]) * 255);
+    data[i * 4 + 3] = Math.round(clamp01(scorch[i]) * 255);
   }
-  const tex = new THREE.DataTexture(data, S, S, THREE.RGBAFormat);
-  tex.wrapS = THREE.RepeatWrapping;
-  tex.wrapT = THREE.RepeatWrapping;
-  tex.magFilter = THREE.LinearFilter;
-  tex.minFilter = THREE.LinearMipmapLinearFilter;
-  tex.generateMipmaps = true;
-  tex.anisotropy = 4;
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.needsUpdate = true;
-  grimeTex = tex;
-  return tex;
+  wearTex = dataTexture(data, S, S, false, true);
+  wearNormalTex = dataTexture(heightToNormal(height, S, S, 2.2, true), S, S, false, true);
+  return { wear: wearTex, normal: wearNormalTex };
 }
 
-/** Shared vertex-coloured "everything else" material: steel, rubber, rust, cloth via the PBR palette. */
+// ---------------------------------------------------------------- materials
+
+const KIT_NOISE_GLSL = /* glsl */ `
+varying vec3 vKitPos;
+float kitHash( vec3 p ) {
+  p = fract( p * 0.3183099 + vec3( 0.1, 0.2, 0.3 ) );
+  p *= 17.0;
+  return fract( p.x * p.y * p.z * ( p.x + p.y + p.z ) );
+}
+float kitNoise( vec3 x ) {
+  vec3 i = floor( x );
+  vec3 f = fract( x );
+  f = f * f * ( 3.0 - 2.0 * f );
+  return mix(
+    mix( mix( kitHash( i ), kitHash( i + vec3( 1.0, 0.0, 0.0 ) ), f.x ), mix( kitHash( i + vec3( 0.0, 1.0, 0.0 ) ), kitHash( i + vec3( 1.0, 1.0, 0.0 ) ), f.x ), f.y ),
+    mix( mix( kitHash( i + vec3( 0.0, 0.0, 1.0 ) ), kitHash( i + vec3( 1.0, 0.0, 1.0 ) ), f.x ), mix( kitHash( i + vec3( 0.0, 1.0, 1.0 ) ), kitHash( i + vec3( 1.0, 1.0, 1.0 ) ), f.x ), f.y ),
+    f.z );
+}
+`;
+
+/** Shared vertex-coloured "everything else" material: steel, rubber, rust, cloth via the PBR palette + object-space grime noise. */
 function kitMaterial(): THREE.MeshStandardMaterial {
   if (!kitMat) {
-    kitMat = new THREE.MeshStandardMaterial({
+    const mat = new THREE.MeshStandardMaterial({
       name: 'vehicleKit',
       color: 0xffffff,
       vertexColors: true,
@@ -234,23 +461,116 @@ function kitMaterial(): THREE.MeshStandardMaterial {
       roughnessMap: pbrPalette(),
       metalnessMap: pbrPalette(),
     });
+    mat.onBeforeCompile = (shader) => {
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nvarying vec3 vKitPos;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvKitPos = position;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `#include <common>\n${KIT_NOISE_GLSL}`)
+        .replace(
+          '#include <metalnessmap_fragment>',
+          /* glsl */ `#include <metalnessmap_fragment>
+          {
+            float kitN = 0.6 * kitNoise( vKitPos * 9.0 ) + 0.4 * kitNoise( vKitPos * 37.0 );
+            diffuseColor.rgb *= 0.74 + 0.5 * kitN;
+            roughnessFactor = clamp( roughnessFactor + ( kitN - 0.5 ) * 0.42, 0.05, 1.0 );
+          }`,
+        );
+    };
+    mat.customProgramCacheKey = () => 'vehicleKit-noise-v2';
+    kitMat = mat;
   }
   return kitMat;
 }
 
+/** Semi-transparent tinted glass: the dark interior reads through it, reflections stay strong. */
 function glassMaterial(): THREE.MeshPhysicalMaterial {
   if (!glassMat) {
     glassMat = new THREE.MeshPhysicalMaterial({
       name: 'tintedGlass',
-      color: 0x10161b,
-      roughness: 0.07,
-      metalness: 0.35,
+      color: 0x0b1216,
+      roughness: 0.06,
+      metalness: 0,
+      transmission: 0,
+      transparent: true,
+      opacity: 0.42,
+      depthWrite: false,
+      envMapIntensity: 3.2,
+      specularIntensity: 1,
       clearcoat: 1,
-      clearcoatRoughness: 0.05,
-      envMapIntensity: 1.4,
+      clearcoatRoughness: 0.04,
     });
   }
   return glassMat;
+}
+
+type DamageUniform = { value: number };
+
+const DAMAGE_GLSL = /* glsl */ `
+float vmCoat = 1.0;
+#if defined( USE_MAP ) && defined( USE_ROUGHNESSMAP )
+{
+  // dusty / rusty (rough) areas carry no lacquer
+  vmCoat = 1.0 - smoothstep( 0.5, 0.82, roughnessFactor );
+  float vmD = clamp( uDamage, 0.0, 1.0 );
+  float vmScrapeEdge = 1.0 - vmD * 0.6;
+  float vmScrape = smoothstep( vmScrapeEdge, vmScrapeEdge + 0.07, texelRoughness.r ) * step( 0.01, vmD );
+  float vmScorchEdge = 1.0 - vmD * 0.95;
+  float vmScorch = smoothstep( vmScorchEdge, vmScorchEdge + 0.3, sampledDiffuseColor.a ) * min( 1.0, vmD * 1.8 );
+  diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 0.42, 0.4, 0.38 ), vmScrape );
+  metalnessFactor = mix( metalnessFactor, 0.95, vmScrape );
+  roughnessFactor = mix( roughnessFactor, 0.4, vmScrape );
+  float vmSoot = vmScorch * ( 1.0 - 0.45 * vmScrape );
+  diffuseColor.rgb *= mix( vec3( 1.0 ), vec3( 0.13, 0.105, 0.09 ), vmSoot );
+  roughnessFactor = mix( roughnessFactor, 0.96, vmSoot );
+  metalnessFactor *= 1.0 - 0.7 * vmSoot;
+  vmCoat *= ( 1.0 - vmSoot ) * ( 1.0 - 0.6 * vmScrape );
+}
+#endif
+`;
+
+const WEAR_MAP_GLSL = /* glsl */ `
+#ifdef USE_MAP
+  vec4 sampledDiffuseColor = texture2D( map, vMapUv );
+  diffuseColor.rgb *= vec3( sampledDiffuseColor.g );
+#endif
+`;
+
+/**
+ * Adds progressive battle damage to a paint material: `uDamage` reveals
+ * bare-metal scrapes (map R of the roughness map) and soot (albedo alpha).
+ * `packedWear` = the albedo map is the shared linear wear texture (G = grime).
+ */
+function addDamageShader(mat: THREE.MeshStandardMaterial, packedWear: boolean): DamageUniform {
+  const damage: DamageUniform = { value: 0 };
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uDamage = damage;
+    let fs = shader.fragmentShader.replace('#include <common>', '#include <common>\nuniform float uDamage;');
+    if (packedWear) fs = fs.replace('#include <map_fragment>', WEAR_MAP_GLSL);
+    fs = fs.replace('#include <metalnessmap_fragment>', `#include <metalnessmap_fragment>\n${DAMAGE_GLSL}`);
+    fs = fs.replace('#include <lights_physical_fragment>', '#include <lights_physical_fragment>\n#ifdef USE_CLEARCOAT\n  material.clearcoat *= vmCoat;\n#endif');
+    shader.fragmentShader = fs;
+  };
+  mat.customProgramCacheKey = () => (packedWear ? 'vehiclePaint-wear-v2' : 'vehiclePaint-hero-v2');
+  return damage;
+}
+
+/** Vertex-coloured scrap paint (raiders, rig): shared wear + normal maps, per-instance damage. */
+function scrapPaint(name: string, roughness: number, metalness: number): { mat: THREE.MeshStandardMaterial; damage: DamageUniform } {
+  const { wear, normal } = wearTextures();
+  const mat = new THREE.MeshStandardMaterial({
+    name,
+    color: 0xffffff,
+    vertexColors: true,
+    map: wear,
+    roughnessMap: wear,
+    metalnessMap: wear,
+    normalMap: normal,
+    normalScale: new THREE.Vector2(0.9, 0.9),
+    roughness,
+    metalness,
+  });
+  return { mat, damage: addDamageShader(mat, true) };
 }
 
 // ---------------------------------------------------------------- geometry primitives
@@ -286,7 +606,7 @@ function beam(a: V3, b: V3, w: number, h: number, up: V3 = AXIS_Y): THREE.Buffer
   const len = a.distanceTo(b);
   const g = new THREE.BoxGeometry(w, h, len);
   const dir = b.clone().sub(a).normalize();
-  const upRef = Math.abs(dir.dot(up)) > 0.98 ? new THREE.Vector3(1, 0, 0) : up;
+  const upRef = Math.abs(dir.dot(up)) > 0.98 ? (Math.abs(dir.x) > 0.9 ? AXIS_Z : AXIS_X) : up;
   const m = new THREE.Matrix4().lookAt(a, b, upRef);
   m.setPosition((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2);
   g.applyMatrix4(m);
@@ -297,6 +617,14 @@ function beam(a: V3, b: V3, w: number, h: number, up: V3 = AXIS_Y): THREE.Buffer
 function tube(pts: V3[], r: number, radial = 6, segPer = 3, tension = 0.35, closed = false): THREE.BufferGeometry {
   const curve = new THREE.CatmullRomCurve3(pts, closed, 'catmullrom', tension);
   return new THREE.TubeGeometry(curve, Math.max(2, (pts.length - (closed ? 0 : 1)) * segPer), r, radial, closed);
+}
+
+/** Weld bead / node: a lumpy low-poly blob at a tube joint. */
+function weld(p: V3, r: number): THREE.BufferGeometry {
+  const g = new THREE.IcosahedronGeometry(r, 0);
+  g.scale(1, 0.85, 1.1);
+  g.translate(p.x, p.y, p.z);
+  return g;
 }
 
 /** Convex polygon plate: `pts` is the back face, extruded by `t` toward `outward`. */
@@ -322,6 +650,104 @@ function plate(ptsIn: V3[], t: number, outward: V3): THREE.BufferGeometry {
     const j = (i + 1) % pts.length;
     tri(pts[i], pts[j], top[j]);
     tri(pts[i], top[j], top[i]);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+/** Flat single-sided polygon decal (fan-triangulated convex polygon) facing `outward`. */
+function decal(ptsIn: V3[], outward: V3): THREE.BufferGeometry {
+  let pts = ptsIn;
+  const n = new THREE.Vector3();
+  for (let i = 0; i < pts.length; i++) n.add(pts[i].clone().cross(pts[(i + 1) % pts.length]));
+  if (n.dot(outward) < 0) pts = pts.slice().reverse();
+  const pos: number[] = [];
+  for (let i = 1; i < pts.length - 1; i++) pos.push(pts[0].x, pts[0].y, pts[0].z, pts[i].x, pts[i].y, pts[i].z, pts[i + 1].x, pts[i + 1].y, pts[i + 1].z);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+/** Rivet heads: 4-sided pyramids (4 triangles each) sitting on a surface that faces `outward`. */
+function rivets(pts: V3[], size: number, outward: V3): THREE.BufferGeometry {
+  const n = outward.clone().normalize();
+  const t1 = new THREE.Vector3().crossVectors(n, Math.abs(n.y) > 0.9 ? AXIS_X : AXIS_Y).normalize();
+  const t2 = new THREE.Vector3().crossVectors(n, t1).normalize();
+  const pos: number[] = [];
+  const h = size * 0.5;
+  for (const p of pts) {
+    const apex = p.clone().addScaledVector(n, size * 0.55);
+    const c = [
+      p.clone().addScaledVector(t1, h).addScaledVector(t2, h),
+      p.clone().addScaledVector(t1, -h).addScaledVector(t2, h),
+      p.clone().addScaledVector(t1, -h).addScaledVector(t2, -h),
+      p.clone().addScaledVector(t1, h).addScaledVector(t2, -h),
+    ];
+    for (let i = 0; i < 4; i++) {
+      const a = c[i];
+      const b = c[(i + 1) % 4];
+      // wind so the face normal points away from the surface
+      const fn = b.clone().sub(a).cross(apex.clone().sub(a));
+      const mid = a.clone().add(b).multiplyScalar(0.5).sub(p);
+      if (fn.dot(mid.addScaledVector(n, size)) >= 0) pos.push(a.x, a.y, a.z, b.x, b.y, b.z, apex.x, apex.y, apex.z);
+      else pos.push(b.x, b.y, b.z, a.x, a.y, a.z, apex.x, apex.y, apex.z);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+/** Points along the closed polygon outline, `pitch` apart, inset toward the centroid. */
+function outlinePts(poly: V3[], pitch: number, inset: number): V3[] {
+  const cen = new THREE.Vector3();
+  for (const p of poly) cen.add(p);
+  cen.multiplyScalar(1 / poly.length);
+  const out: V3[] = [];
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const n = Math.max(1, Math.round(a.distanceTo(b) / pitch));
+    for (let k = 0; k < n; k++) {
+      const p = a.clone().lerp(b, (k + 0.5) / n);
+      const toC = cen.clone().sub(p);
+      const d = toC.length();
+      out.push(p.addScaledVector(toC, Math.min(0.45, inset / Math.max(d, 1e-4))));
+    }
+  }
+  return out;
+}
+
+/** Static rag / pennant: a slightly curled, tattered, double-sided strip. Local: hangs from the origin along +X, drooping -Y. */
+function rag(w: number, h: number, curl: number, seed: number): THREE.BufferGeometry {
+  const rand = rng(seed);
+  const nx = 5;
+  const ny = 2;
+  const pts: V3[][] = [];
+  for (let j = 0; j <= ny; j++) {
+    const row: V3[] = [];
+    for (let i = 0; i <= nx; i++) {
+      const u = i / nx;
+      const t = j / ny;
+      const tatter = i === nx ? (rand() - 0.3) * 0.22 * w : 0;
+      row.push(v(u * w + tatter, -t * h * (1 - 0.25 * u) - 0.12 * w * u * u, curl * Math.sin(u * 4.4 + t * 1.6) * (0.25 + u)));
+    }
+    pts.push(row);
+  }
+  const pos: number[] = [];
+  const tri = (a: V3, b: V3, c: V3): void => {
+    pos.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+    pos.push(a.x, a.y, a.z, c.x, c.y, c.z, b.x, b.y, b.z);
+  };
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      tri(pts[j][i], pts[j + 1][i], pts[j][i + 1]);
+      tri(pts[j][i + 1], pts[j + 1][i], pts[j + 1][i + 1]);
+    }
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
@@ -378,8 +804,26 @@ function deform(geo: THREE.BufferGeometry, fn: (p: V3) => void): THREE.BufferGeo
   return geo;
 }
 
-/** Per-triangle colour (crisp livery edges without a texture). Geometry must be non-indexed. */
-function colorTris(geo: THREE.BufferGeometry, fn: (centroid: V3, normal: V3) => number): THREE.BufferGeometry {
+/** Per-vertex colour from position (smooth gradients: mud, heat-blueing). */
+function tint(geo: THREE.BufferGeometry, fn: (p: V3) => number | THREE.Color): THREE.BufferGeometry {
+  const pos = posAttr(geo);
+  const col = new Float32Array(pos.count * 3);
+  const p = new THREE.Vector3();
+  const color = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) {
+    p.fromBufferAttribute(pos, i);
+    const c = fn(p);
+    if (typeof c === 'number') color.set(c);
+    else color.copy(c);
+    col.set([color.r, color.g, color.b], i * 3);
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return geo;
+}
+
+/** Per-triangle colour (crisp livery edges without a texture). Returns a non-indexed geometry. */
+function colorTris(geoIn: THREE.BufferGeometry, fn: (centroid: V3, normal: V3, tri: number) => number): THREE.BufferGeometry {
+  const geo = geoIn.index ? geoIn.toNonIndexed() : geoIn;
   const pos = posAttr(geo);
   const col = new Float32Array(pos.count * 3);
   const a = new THREE.Vector3();
@@ -393,8 +837,11 @@ function colorTris(geo: THREE.BufferGeometry, fn: (centroid: V3, normal: V3) => 
     b.fromBufferAttribute(pos, i + 1);
     c.fromBufferAttribute(pos, i + 2);
     cen.copy(a).add(b).add(c).multiplyScalar(1 / 3);
-    nor.copy(b).sub(a).cross(c.clone().sub(a)).normalize();
-    color.set(fn(cen, nor));
+    nor.copy(b).sub(a).cross(c.clone().sub(a));
+    const l = nor.length();
+    if (l > 1e-12) nor.multiplyScalar(1 / l);
+    else nor.set(0, 1, 0);
+    color.set(fn(cen, nor, i / 3));
     for (let k = 0; k < 3; k++) col.set([color.r, color.g, color.b], (i + k) * 3);
   }
   geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
@@ -443,7 +890,10 @@ class Asm {
   private readonly stack: THREE.Matrix4[] = [new THREE.Matrix4()];
   readonly rand: () => number;
 
-  constructor(seed: number) {
+  constructor(
+    seed: number,
+    private readonly label = 'asm',
+  ) {
     this.rand = rng(seed);
   }
 
@@ -490,19 +940,18 @@ class Asm {
     if (!list || list.length === 0) return undefined;
     const merged = mergeGeometries(list, false);
     for (const g of list) g.dispose();
+    this.buckets.delete(bucket);
     if (!merged) return undefined;
-    merged.computeBoundingBox();
-    merged.computeBoundingSphere();
-    return merged;
+    return sanitize(merged, `${this.label}.${bucket}`);
   }
 }
 
 /** Road dust: fade vertex colours toward dust near the ground. */
-function dustGradient(geo: THREE.BufferGeometry | undefined, top: number, amount: number): void {
+function dustGradient(geo: THREE.BufferGeometry | undefined, top: number, amount: number, dustColor: number = C.dust): void {
   if (!geo) return;
   const pos = posAttr(geo);
   const col = geo.getAttribute('color') as THREE.BufferAttribute;
-  const dust = new THREE.Color(C.dust);
+  const dust = new THREE.Color(dustColor);
   for (let i = 0; i < pos.count; i++) {
     const k = amount * sm(top, 0, pos.getY(i));
     if (k <= 0) continue;
@@ -510,7 +959,7 @@ function dustGradient(geo: THREE.BufferGeometry | undefined, top: number, amount
   }
 }
 
-/** Box-projected UVs (per triangle, by dominant normal) for the grime map on paint. */
+/** Box-projected UVs (per triangle, by dominant normal) for the wear maps on paint. */
 function boxUV(geo: THREE.BufferGeometry | undefined, scale: number): void {
   if (!geo) return;
   const pos = posAttr(geo);
@@ -593,6 +1042,295 @@ function archFlare(rIn: number, rOut: number, width: number, droop: number): THR
   return toCreasedNormals(g, 0.7);
 }
 
+// ---------------------------------------------------------------- lofted car body
+
+/**
+ * Ring point ids, bottom centre -> top centre on the +X half:
+ * UC underside centre, UT wheel-tub foot, TW tub wall top, SL sill, RK rocker, WS waist,
+ * CH character line, SH shoulder roll, BT belt, GB greenhouse base, WB window bottom,
+ * WT window top, RO roof rail outer, RI roof rail inner, R1/R2 roof, TC top centre.
+ */
+const RID = { UC: 0, UT: 1, TW: 2, SL: 3, RK: 4, WS: 5, CH: 6, SH: 7, BT: 8, GB: 9, WB: 10, WT: 11, RO: 12, RI: 13, R1: 14, R2: 15, TC: 16 } as const;
+/** Texture v per ring id on the +X half (mirrored as 1 - v), roughly proportional to arc length. */
+const RING_V = [0, 0.018, 0.03, 0.045, 0.075, 0.115, 0.16, 0.19, 0.212, 0.235, 0.25, 0.305, 0.318, 0.335, 0.4, 0.455, 0.5];
+const SIDE_F = [0, 0.14, 0.42, 0.72, 0.93, 1.0];
+const SIDE_X = [0.965, 0.995, 0.972, 1.0, 0.968, 0.93];
+const RING_HI = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+const RING_LO = [3, 6, 8, 10, 11, 13, 16];
+
+/** One cross-section: top/bottom centreline points (z may differ: raked faces), half width, cabin height and widths. */
+type Rib = { zt: number; yt: number; zb: number; yb: number; w: number; h: number; gb: number; gt: number };
+type Arch = { cz: number; cy: number; r: number; bulge: number };
+type LoftSpec = {
+  /** Ordered rear (-Z) to front (+Z). */
+  ribs: Rib[];
+  arches: Arch[];
+  xTub: number;
+  crown: number;
+  /** Low-res ring (7 half points, open underside) for wrecks. */
+  lo: boolean;
+  /** Cell role between ribs i, i+1 and ring ids a < b: 0 = hole, 1 = body, 2 = glass. */
+  cell: (i: number, a: number, b: number, side: number) => number;
+  warp?: (p: V3, i: number, id: number, side: number) => void;
+  /** Per-cell vertex colour (wrecks). Hull paint stays white. */
+  color?: (i: number, a: number, b: number, side: number, cen: V3, nor: V3) => number;
+  /** Ring ids that always break smoothing (hard panel edges). */
+  hardIds?: readonly number[];
+  /** Rib indices that always break smoothing. */
+  hardRibs?: readonly number[];
+  creaseAngle?: number;
+  label: string;
+};
+type LoftOut = {
+  body?: THREE.BufferGeometry;
+  glass?: THREE.BufferGeometry;
+  /** Final ring positions, nr x nq x 3. */
+  P: Float32Array;
+  /** Unit face normal per cell, (nr-1) x (nq-1) x 3. */
+  N: Float32Array;
+  nr: number;
+  nq: number;
+  u: number[];
+  vv: number[];
+};
+
+function ribPoint(spec: LoftSpec, r: Rib, id: number, out: V3): V3 {
+  const deck = (x: number): number => r.yt - spec.crown * (x / r.w) ** 2;
+  let arch = -Infinity;
+  let bulge = 0;
+  for (const a of spec.arches) {
+    const d = r.zb - a.cz;
+    if (Math.abs(d) < a.r) arch = Math.max(arch, a.cy + Math.sqrt(a.r * a.r - d * d));
+    bulge = Math.max(bulge, a.bulge * Math.exp(-((d / (a.r * 1.15)) ** 2)));
+  }
+  const yBT = deck(r.w * 0.93);
+  arch = Math.min(arch, yBT - 0.05);
+  const H = yBT - r.yb;
+  let x = 0;
+  let y = r.yb;
+  if (id <= RID.TW) {
+    x = id === RID.UC ? 0 : Math.min(spec.xTub, r.w * 0.8);
+    if (id === RID.TW) y = Math.max(r.yb, arch);
+  } else if (id <= RID.BT) {
+    y = r.yb + H * SIDE_F[id - 3];
+    x = r.w * SIDE_X[id - 3];
+    if (id < RID.BT && y < arch) {
+      y = arch;
+      x = r.w + bulge;
+    } else if (bulge > 0) {
+      x += bulge * lerp(1, 0.3, sm(Math.max(arch, r.yb), yBT, y));
+    }
+  } else if (id <= RID.RO) {
+    const t = id === RID.GB ? 0 : id === RID.WB ? 0.1 : id === RID.WT ? 0.9 : 0.985;
+    x = lerp(r.gb, r.gt, t);
+    y = deck(x) + r.h * t;
+  } else {
+    const k = id === RID.RI ? 1 : id === RID.R1 ? 0.62 : id === RID.R2 ? 0.3 : 0;
+    const xr = Math.max(0.02, r.gt - 0.07);
+    x = xr * k;
+    y = deck(x) + r.h + 0.022 * (1 - k * k) * Math.min(1, r.h / 0.2);
+  }
+  const span = r.yt - r.yb;
+  const fz = span > 1e-4 ? clamp01((y - r.yb) / span) : 1;
+  return out.set(x, y, lerp(r.zb, r.zt, fz));
+}
+
+/** Loft the ribs into a body shell (+ optional inset glass) with crease-aware smooth normals and unwrapped UVs. */
+function loftBody(spec: LoftSpec): LoftOut {
+  const half = spec.lo ? RING_LO : RING_HI;
+  const ids: number[] = [...half];
+  const sides: number[] = half.map(() => 1);
+  for (let k = half.length - 2; k >= 0; k--) {
+    ids.push(half[k]);
+    sides.push(-1);
+  }
+  const nq = ids.length;
+  const nr = spec.ribs.length;
+  const P = new Float32Array(nr * nq * 3);
+  const p = new THREE.Vector3();
+  for (let i = 0; i < nr; i++) {
+    for (let q = 0; q < nq; q++) {
+      ribPoint(spec, spec.ribs[i], ids[q], p);
+      p.x *= sides[q];
+      if (spec.warp) spec.warp(p, i, ids[q], sides[q]);
+      P.set([p.x, p.y, p.z], (i * nq + q) * 3);
+    }
+  }
+  // unwrapped texture coordinates: u follows surface distance along the body, v the ring
+  const u: number[] = [0];
+  const probe = [RING_HI.length - 1, 0, Math.min(3, nq - 1)].filter((q) => q < nq);
+  for (let i = 1; i < nr; i++) {
+    let d = 0;
+    for (const q of probe) {
+      const a = ((i - 1) * nq + q) * 3;
+      const b = (i * nq + q) * 3;
+      d = Math.max(d, Math.hypot(P[b] - P[a], P[b + 1] - P[a + 1], P[b + 2] - P[a + 2]));
+    }
+    u.push(u[i - 1] + Math.max(d, 1e-4));
+  }
+  const total = u[nr - 1];
+  for (let i = 0; i < nr; i++) u[i] /= total;
+  const vv = ids.map((id, q) => (sides[q] > 0 ? RING_V[id] : 1 - RING_V[id]));
+
+  // per-cell triangles: (A, D, B) and (D, C, B) face outward
+  const nc = nq - 1;
+  const cellCount = (nr - 1) * nc;
+  const N = new Float32Array(cellCount * 3);
+  const triN = new Float32Array(cellCount * 2 * 3); // area-weighted
+  const triOK = new Uint8Array(cellCount * 2);
+  const corner = (i: number, q: number): number => (i * nq + q) * 3;
+  const faceN = (ia: number, ib: number, ic: number, out: Float32Array, o: number): number => {
+    const ux = P[ib] - P[ia];
+    const uy = P[ib + 1] - P[ia + 1];
+    const uz = P[ib + 2] - P[ia + 2];
+    const wx = P[ic] - P[ia];
+    const wy = P[ic + 1] - P[ia + 1];
+    const wz = P[ic + 2] - P[ia + 2];
+    out[o] = uy * wz - uz * wy;
+    out[o + 1] = uz * wx - ux * wz;
+    out[o + 2] = ux * wy - uy * wx;
+    return Math.hypot(out[o], out[o + 1], out[o + 2]);
+  };
+  for (let i = 0; i < nr - 1; i++) {
+    for (let q = 0; q < nc; q++) {
+      const c = i * nc + q;
+      const A = corner(i, q);
+      const B = corner(i + 1, q);
+      const Cc = corner(i + 1, q + 1);
+      const D = corner(i, q + 1);
+      const l0 = faceN(A, D, B, triN, c * 6);
+      const l1 = faceN(D, Cc, B, triN, c * 6 + 3);
+      triOK[c * 2] = l0 > 2e-6 ? 1 : 0;
+      triOK[c * 2 + 1] = l1 > 2e-6 ? 1 : 0;
+      const nx = (triOK[c * 2] ? triN[c * 6] : 0) + (triOK[c * 2 + 1] ? triN[c * 6 + 3] : 0);
+      const ny = (triOK[c * 2] ? triN[c * 6 + 1] : 0) + (triOK[c * 2 + 1] ? triN[c * 6 + 4] : 0);
+      const nz = (triOK[c * 2] ? triN[c * 6 + 2] : 0) + (triOK[c * 2 + 1] ? triN[c * 6 + 5] : 0);
+      const l = Math.hypot(nx, ny, nz);
+      if (l > 1e-9) N.set([nx / l, ny / l, nz / l], c * 3);
+      else N.set([0, 1, 0], c * 3);
+    }
+  }
+  // smoothing bands
+  const hardIds = spec.hardIds ?? [];
+  const hardRibs = spec.hardRibs ?? [];
+  const ringBand = (q: number): number => {
+    const a = Math.min(ids[q], ids[q + 1]);
+    let band = 0;
+    for (const h of hardIds) if (a >= h) band++;
+    return band;
+  };
+  const ribBand = (i: number): number => {
+    let band = 0;
+    for (const h of hardRibs) if (i >= h) band++;
+    return band;
+  };
+  const creaseCos = Math.cos(spec.creaseAngle ?? 0.7);
+  const cornerNormal = (i: number, q: number, c: number, tri: number, out: number[]): void => {
+    const fo = c * 6 + tri * 3;
+    const fl = Math.hypot(triN[fo], triN[fo + 1], triN[fo + 2]);
+    const fx = triN[fo] / fl;
+    const fy = triN[fo + 1] / fl;
+    const fz = triN[fo + 2] / fl;
+    const rb = ringBand(c % nc);
+    const ib = ribBand(Math.floor(c / nc));
+    let nx = 0;
+    let ny = 0;
+    let nz = 0;
+    for (let di = -1; di <= 0; di++) {
+      for (let dq = -1; dq <= 0; dq++) {
+        const ci = i + di;
+        const cq = q + dq;
+        if (ci < 0 || ci >= nr - 1 || cq < 0 || cq >= nc) continue;
+        if (ringBand(cq) !== rb || ribBand(ci) !== ib) continue;
+        const cc = ci * nc + cq;
+        for (let t = 0; t < 2; t++) {
+          if (!triOK[cc * 2 + t]) continue;
+          // does this triangle touch the vertex? tri 0 = (A, D, B), tri 1 = (D, C, B)
+          const isA = di === 0 && dq === 0;
+          const isC = di === -1 && dq === -1;
+          if (t === 0 && isC) continue;
+          if (t === 1 && isA) continue;
+          const o = cc * 6 + t * 3;
+          const l = Math.hypot(triN[o], triN[o + 1], triN[o + 2]);
+          if ((triN[o] * fx + triN[o + 1] * fy + triN[o + 2] * fz) / l < creaseCos) continue;
+          nx += triN[o];
+          ny += triN[o + 1];
+          nz += triN[o + 2];
+        }
+      }
+    }
+    const l = Math.hypot(nx, ny, nz);
+    if (l > 1e-9) out.push(nx / l, ny / l, nz / l);
+    else out.push(fx, fy, fz);
+  };
+
+  const bPos: number[] = [];
+  const bNor: number[] = [];
+  const bUv: number[] = [];
+  const bCol: number[] = [];
+  const gPos: number[] = [];
+  const gNor: number[] = [];
+  const cen = new THREE.Vector3();
+  const nor = new THREE.Vector3();
+  const color = new THREE.Color();
+  for (let i = 0; i < nr - 1; i++) {
+    for (let q = 0; q < nc; q++) {
+      const c = i * nc + q;
+      const a = Math.min(ids[q], ids[q + 1]);
+      const b = Math.max(ids[q], ids[q + 1]);
+      const side = sides[ids[q] === RID.TC ? q + 1 : q];
+      const role = spec.cell(i, a, b, side);
+      if (role === 0) continue;
+      const quad: [number, number][] = [
+        [i, q],
+        [i, q + 1],
+        [i + 1, q],
+        [i, q + 1],
+        [i + 1, q + 1],
+        [i + 1, q],
+      ];
+      if (spec.color && role === 1) {
+        cen.set(0, 0, 0);
+        for (const [ci, cq] of [quad[0], quad[1], quad[2], quad[4]]) {
+          const o = corner(ci, cq);
+          cen.x += P[o] * 0.25;
+          cen.y += P[o + 1] * 0.25;
+          cen.z += P[o + 2] * 0.25;
+        }
+        nor.set(N[c * 3], N[c * 3 + 1], N[c * 3 + 2]);
+        color.set(spec.color(i, a, b, side, cen, nor));
+      } else color.set(0xffffff);
+      for (let t = 0; t < 2; t++) {
+        if (!triOK[c * 2 + t]) continue;
+        for (let k = 0; k < 3; k++) {
+          const [ci, cq] = quad[t * 3 + k];
+          const o = corner(ci, cq);
+          if (role === 2) {
+            // glass sits a little inside the frame
+            gPos.push(P[o] - N[c * 3] * 0.012, P[o + 1] - N[c * 3 + 1] * 0.012, P[o + 2] - N[c * 3 + 2] * 0.012);
+            cornerNormal(ci, cq, c, t, gNor);
+          } else {
+            bPos.push(P[o], P[o + 1], P[o + 2]);
+            cornerNormal(ci, cq, c, t, bNor);
+            bUv.push(u[ci], vv[cq]);
+            bCol.push(color.r, color.g, color.b);
+          }
+        }
+      }
+    }
+  }
+  const make = (pos: number[], norm: number[], uv?: number[], col?: number[]): THREE.BufferGeometry | undefined => {
+    if (pos.length === 0) return undefined;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(norm, 3));
+    if (uv) g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+    if (col) g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    return g;
+  };
+  return { body: make(bPos, bNor, bUv, bCol), glass: make(gPos, gNor), P, N, nr, nq, u, vv };
+}
+
 // ---------------------------------------------------------------- wheels
 
 type WheelSpec = {
@@ -601,10 +1339,12 @@ type WheelSpec = {
   seg: number;
   lugs: number;
   rim: Look;
-  spokes: number;
-  nuts: number;
+  /** alloy = deep-dish split spokes + brake disc, steel = scrap beadlock dish, truck = hub-nut commercial rim. */
+  style: 'alloy' | 'steel' | 'truck';
   hubSpike: number;
   dual: boolean;
+  /** 0..1 mud caking on tread and lower sidewall. */
+  mud: number;
 };
 
 const wheelCache = new Map<string, { left: THREE.BufferGeometry; right: THREE.BufferGeometry }>();
@@ -613,9 +1353,12 @@ const wheelCache = new Map<string, { left: THREE.BufferGeometry; right: THREE.Bu
 function wheelGeometry(key: string, spec: WheelSpec): { left: THREE.BufferGeometry; right: THREE.BufferGeometry } {
   const hit = wheelCache.get(key);
   if (hit) return hit;
-  const a = new Asm(4242);
+  const a = new Asm(4242, `wheel.${key}`);
   const { r, w, seg } = spec;
-  const rimR = r * 0.6;
+  const rimR = r * (spec.style === 'alloy' ? 0.64 : 0.58);
+  const rubber = new THREE.Color(C.rubber);
+  const mud = new THREE.Color(C.mud);
+  const dusty = new THREE.Color(C.tread);
   const tyres: [number, number][] = spec.dual
     ? [
         [-w * 0.265, w * 0.47],
@@ -623,56 +1366,196 @@ function wheelGeometry(key: string, spec: WheelSpec): { left: THREE.BufferGeomet
       ]
     : [[0, w]];
   for (const [cx, tw] of tyres) {
-    const profile: P2[] = [
-      [rimR, -0.44 * tw],
-      [r * 0.8, -0.5 * tw],
-      [r * 0.94, -0.47 * tw],
-      [r, -0.34 * tw],
-      [r, 0.34 * tw],
-      [r * 0.94, 0.47 * tw],
-      [r * 0.8, 0.5 * tw],
-      [rimR, 0.44 * tw],
+    // rounded shoulder, bulged sidewall, bead tucked into the rim
+    const halfProfile: P2[] = [
+      [rimR * 0.99, -0.4],
+      [rimR + 0.035 * r, -0.465],
+      [r * 0.8, -0.5],
+      [r * 0.9, -0.488],
+      [r * 0.955, -0.44],
+      [r * 0.988, -0.345],
+      [r, -0.17],
     ];
-    a.add('w', latheX(profile, seg), L.rubber, { p: [cx, 0, 0] });
-    // chunky tread blocks on both shoulders, staggered
+    const profile: P2[] = [...halfProfile.map(([pr, ax]): P2 => [pr, ax * tw]), ...halfProfile.reverse().map(([pr, ax]): P2 => [pr, -ax * tw])];
+    const tyre = latheX(profile, seg);
+    tint(tyre, (p) => {
+      const rad = Math.hypot(p.y, p.z);
+      const n = hash3(Math.round(p.x * 40), Math.round(p.y * 14), Math.round(p.z * 14));
+      const c = rubber.clone().lerp(dusty, 0.5 * sm(r * 0.9, r, rad));
+      if (spec.mud > 0) c.lerp(mud, spec.mud * sm(r * 0.62, r * 0.98, rad) * (0.45 + 0.55 * n));
+      return c;
+    });
+    a.add('w', tyre, L.rubber, { p: [cx, 0, 0] });
+    // tread: staggered chevron shoulder lugs + centre blocks
+    const lugLook = spec.mud > 0.4 ? look(0x33271c, 1, 0, 0.14) : L.tread;
     for (let side = -1; side <= 1; side += 2) {
       if (spec.dual && side * cx < 0) continue;
       for (let i = 0; i < spec.lugs; i++) {
         const ang = ((i + (side > 0 ? 0.5 : 0)) / spec.lugs) * Math.PI * 2;
-        const lug = box(tw * (spec.dual ? 0.5 : 0.36), r * 0.085, r * 0.2);
-        lug.rotateY(side * 0.3);
-        lug.translate(0, r * 0.99, 0);
-        a.add('w', lug, L.tread, { p: [cx + side * tw * (spec.dual ? 0.2 : 0.3), 0, 0], r: [ang, 0, 0] });
+        const lug = box(tw * (spec.dual ? 0.46 : 0.3), r * 0.07, r * 0.17);
+        lug.rotateY(side * 0.34);
+        lug.translate(0, r * 0.985, 0);
+        a.add('w', lug, lugLook, { p: [cx + side * tw * (spec.dual ? 0.2 : 0.32), 0, 0], r: [ang, 0, 0] });
+      }
+    }
+    if (!spec.dual) {
+      for (let i = 0; i < spec.lugs; i++) {
+        const ang = ((i + 0.25) / spec.lugs) * Math.PI * 2;
+        const blk = box(tw * 0.2, r * 0.06, r * 0.13);
+        blk.translate(0, r * 0.99, 0);
+        a.add('w', blk, lugLook, { p: [cx, 0, 0], r: [ang, 0, 0] });
       }
     }
   }
   const outer = w * 0.5;
-  const rimProfile: P2[] = [
-    [0, -outer * 0.6],
-    [rimR, -outer * 0.86],
-    [rimR * 1.04, outer * 0.9],
-    [rimR * 0.95, outer * 0.84],
-    [rimR * 0.84, outer * 0.34],
-    [rimR * 0.36, outer * 0.2],
-    [0, outer * 0.2],
-  ];
-  a.add('w', latheX(rimProfile, seg), spec.rim);
-  const faceX = outer * 0.3;
-  for (let i = 0; i < spec.spokes; i++) {
-    const ang = (i / spec.spokes) * Math.PI * 2;
-    const spoke = box(outer * 0.22, rimR * 0.62, rimR * 0.22);
-    spoke.translate(0, rimR * 0.56, 0);
-    a.add('w', spoke, look(spec.rim.c, spec.rim.r, spec.rim.m, 0.1), { p: [faceX, 0, 0], r: [ang, 0, 0] });
+  // sidewall lettering hint: two arcs of pale raised blocks on the outer wall
+  {
+    const lr = r * 0.855;
+    const lx = outer * 0.985;
+    const letter = new THREE.Color(0x77736a);
+    const blocks = [0, 1, 2, 3, 4, 6, 7, 8];
+    for (const arc of [0.35, 0.35 + Math.PI]) {
+      for (const k of blocks) {
+        const ang = arc + k * 0.085;
+        const hw = 0.028 * r * (k % 3 === 1 ? 0.6 : 1);
+        const g = decal([v(0, lr - 0.03 * r, -hw), v(0, lr - 0.03 * r, hw), v(0, lr + 0.035 * r, hw), v(0, lr + 0.035 * r, -hw)], AXIS_X);
+        tint(g, () => letter);
+        a.add('w', g, L.rubber, { p: [lx, 0, 0], r: [ang, 0, 0] });
+      }
+    }
   }
-  a.add('w', cylX(rimR * 0.24, rimR * 0.32, outer * 0.42, 8), L.steelDark, { p: [faceX + outer * 0.1, 0, 0] });
-  for (let i = 0; i < spec.nuts; i++) {
-    const ang = ((i + 0.5) / spec.nuts) * Math.PI * 2;
-    const nut = box(outer * 0.16, rimR * 0.09, rimR * 0.09);
-    nut.translate(0, rimR * 0.44, 0);
-    a.add('w', nut, L.chrome, { p: [faceX + outer * 0.12, 0, 0], r: [ang, 0, 0] });
+  const rimDark = look(new THREE.Color(spec.rim.c).multiplyScalar(0.45).getHex(), 0.6, spec.rim.m, 0);
+  if (spec.style === 'alloy') {
+    // open deep-dish barrel: outer lip, inner barrel wall, dark back plate
+    a.add(
+      'w',
+      latheX(
+        [
+          [rimR * 0.99, -outer * 0.86],
+          [rimR * 1.06, outer * 0.9],
+          [rimR * 0.985, outer * 0.96],
+          [rimR * 0.9, outer * 0.84],
+          [rimR * 0.87, -outer * 0.42],
+        ],
+        seg,
+      ),
+      spec.rim,
+    );
+    a.add(
+      'w',
+      latheX(
+        [
+          [rimR * 0.87, -outer * 0.42],
+          [0.0001, -outer * 0.42],
+        ],
+        seg,
+      ),
+      L.matte,
+    );
+    // vented brake disc + hat, visible between the spokes
+    const discX = -outer * 0.12;
+    a.add('w', cylX(rimR * 0.8, rimR * 0.8, 0.03, 20), look(0x6f7175, 0.34, 1, 0), { p: [discX, 0, 0] });
+    a.add('w', cylX(rimR * 0.34, rimR * 0.38, 0.07, 12), L.steelDark, { p: [discX + 0.03, 0, 0] });
+    for (let i = 0; i < 12; i++) {
+      const ang = (i / 12) * Math.PI * 2;
+      a.add('w', box(0.004, rimR * 0.22, 0.012).translate(0, rimR * 0.58, 0), L.blackMetal, { p: [discX + 0.016, 0, 0], r: [ang, 0, 0] });
+    }
+    // five split (Y) spokes, set back from the lip
+    const hubX = outer * 0.2;
+    const tipX = outer * 0.46;
+    const spokeLook = look(spec.rim.c, spec.rim.r, spec.rim.m, 0.06);
+    for (let i = 0; i < 5; i++) {
+      const ang = (i / 5) * Math.PI * 2;
+      for (const d of [-0.23, 0.23]) {
+        const from = v(hubX, rimR * 0.2 * Math.cos(d * 0.6), rimR * 0.2 * Math.sin(d * 0.6));
+        const to = v(tipX, rimR * 0.9 * Math.cos(d), rimR * 0.9 * Math.sin(d));
+        const spoke = beam(from, to, rimR * 0.12, outer * 0.24, AXIS_X);
+        a.add('w', spoke, spokeLook, { r: [ang, 0, 0] });
+      }
+      const web = beam(v(hubX, rimR * 0.14, 0), v(hubX + (tipX - hubX) * 0.45, rimR * 0.5, 0), rimR * 0.2, outer * 0.2, AXIS_X);
+      a.add('w', web, spokeLook, { r: [ang, 0, 0] });
+    }
+    a.add('w', cylX(rimR * 0.2, rimR * 0.27, outer * 0.34, 10), spec.rim, { p: [hubX + outer * 0.05, 0, 0] });
+    a.add('w', cylX(rimR * 0.1, rimR * 0.13, outer * 0.1, 8), L.blackMetal, { p: [hubX + outer * 0.25, 0, 0] });
+    for (let i = 0; i < 5; i++) {
+      const ang = ((i + 0.5) / 5) * Math.PI * 2;
+      a.add('w', cylX(rimR * 0.035, rimR * 0.04, outer * 0.12, 5), L.chrome, { p: [hubX + outer * 0.22, rimR * 0.19 * Math.cos(ang), rimR * 0.19 * Math.sin(ang)] });
+    }
+  } else if (spec.style === 'steel') {
+    a.add(
+      'w',
+      latheX(
+        [
+          [rimR * 0.99, -outer * 0.86],
+          [rimR * 1.07, outer * 0.88],
+          [rimR * 0.97, outer * 0.94],
+          [rimR * 0.88, outer * 0.52],
+          [rimR * 0.5, outer * 0.3],
+          [rimR * 0.3, outer * 0.44],
+          [0.0001, outer * 0.44],
+        ],
+        seg,
+      ),
+      spec.rim,
+    );
+    // lightening holes + beadlock bolts
+    for (let i = 0; i < 6; i++) {
+      const ang = (i / 6) * Math.PI * 2;
+      a.add('w', cylX(rimR * 0.1, rimR * 0.1, 0.012, 7), L.matte, {
+        p: [outer * 0.425, rimR * 0.69 * Math.cos(ang), rimR * 0.69 * Math.sin(ang)],
+        r: [0, 0, 0],
+      });
+    }
+    const bolts: V3[] = [];
+    for (let i = 0; i < 10; i++) {
+      const ang = ((i + 0.5) / 10) * Math.PI * 2;
+      bolts.push(v(outer * 0.93, rimR * 1.02 * Math.cos(ang), rimR * 1.02 * Math.sin(ang)));
+    }
+    a.add('w', rivets(bolts, rimR * 0.1, AXIS_X), L.steel);
+    a.add('w', cylX(rimR * 0.2, rimR * 0.3, outer * 0.3, 8), rimDark, { p: [outer * 0.5, 0, 0] });
+  } else {
+    const face = spec.dual ? 0.0 : 0.3;
+    a.add(
+      'w',
+      latheX(
+        spec.dual
+          ? [
+              [rimR * 0.99, -outer * 0.3],
+              [rimR * 1.06, outer * 0.86],
+              [rimR * 0.96, outer * 0.92],
+              [rimR * 0.87, outer * 0.02],
+              [rimR * 0.42, outer * 0.02],
+              [rimR * 0.32, outer * 0.3],
+              [0.0001, outer * 0.3],
+            ]
+          : [
+              [rimR * 0.99, -outer * 0.86],
+              [rimR * 1.06, outer * 0.86],
+              [rimR * 0.96, outer * 0.92],
+              [rimR * 0.86, outer * 0.3],
+              [rimR * 0.52, outer * 0.3],
+              [rimR * 0.44, outer * 0.78],
+              [rimR * 0.2, outer * 0.92],
+              [0.0001, outer * 0.92],
+            ],
+        seg,
+      ),
+      spec.rim,
+    );
+    const nuts: V3[] = [];
+    for (let i = 0; i < 8; i++) {
+      const ang = ((i + 0.5) / 8) * Math.PI * 2;
+      nuts.push(v(outer * face + 0.004, rimR * 0.68 * Math.cos(ang), rimR * 0.68 * Math.sin(ang)));
+    }
+    a.add('w', rivets(nuts, rimR * 0.13, AXIS_X), L.steel);
+    for (let i = 0; i < 4; i++) {
+      const ang = (i / 4) * Math.PI * 2 + 0.4;
+      a.add('w', cylX(rimR * 0.09, rimR * 0.09, 0.012, 6), L.matte, { p: [outer * face + 0.006, rimR * 0.68 * Math.cos(ang), rimR * 0.68 * Math.sin(ang)] });
+    }
   }
   if (spec.hubSpike > 0) {
-    a.add('w', rod(v(faceX, 0, 0), v(faceX + spec.hubSpike, 0, 0), rimR * 0.26, 5, 0), L.rust);
+    const base = spec.style === 'truck' ? outer * 0.9 : outer * 0.6;
+    a.add('w', rod(v(base, 0, 0), v(base + spec.hubSpike, 0, 0), rimR * 0.24, 5, 0), L.rust);
   }
   const left = a.build('w') as THREE.BufferGeometry;
   const result = { left, right: mirrorGeometryX(left) };
@@ -684,6 +1567,16 @@ function wheelGeometry(key: string, spec: WheelSpec): { left: THREE.BufferGeomet
 
 type Socket = { p: T3; d: T3 };
 type WheelDef = { name: string; p: T3; geo: THREE.BufferGeometry; steer: boolean };
+/** Extra mesh: static brake callipers, recoil barrel, or cosmetic parts that fall off with damage. */
+type Extra = {
+  name: string;
+  geo: THREE.BufferGeometry;
+  /** body / root / turret, or the index of a steering pivot. */
+  parent: 'body' | 'root' | 'turret' | number;
+  p?: T3;
+  /** Hidden once damage reaches this level. */
+  hideAt?: number;
+};
 type Blueprint = {
   paint?: THREE.BufferGeometry;
   kit?: THREE.BufferGeometry;
@@ -692,6 +1585,7 @@ type Blueprint = {
   tail?: THREE.BufferGeometry;
   accent?: THREE.BufferGeometry;
   turret?: { geo: THREE.BufferGeometry; p: T3; muzzles: Socket[] };
+  extras?: Extra[];
   bodyMuzzles: Socket[];
   exhausts: Socket[];
   wheels: WheelDef[];
@@ -702,6 +1596,7 @@ type Blueprint = {
 type Livery = {
   name: string;
   paint: THREE.MeshStandardMaterial;
+  damage: DamageUniform;
   scorchRoughness: number;
   headColor: number;
   headEmissive: number;
@@ -726,6 +1621,7 @@ function instantiate(bp: Blueprint, livery: Livery): VehicleModel {
   root.add(body);
 
   const paintMat = livery.paint;
+  // lens vertex colour scales the emissive, so "switched off" lamps can share the material
   const headlightMaterial = new THREE.MeshStandardMaterial({
     name: 'headlight',
     color: livery.headColor,
@@ -733,7 +1629,15 @@ function instantiate(bp: Blueprint, livery: Livery): VehicleModel {
     emissiveIntensity: 2.2,
     roughness: 0.25,
     metalness: 0,
+    vertexColors: true,
   });
+  headlightMaterial.onBeforeCompile = (shader) => {
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <emissivemap_fragment>',
+      '#include <emissivemap_fragment>\n#ifdef USE_COLOR\n  totalEmissiveRadiance *= max( vColor.rgb, vec3( 0.0 ) );\n#endif',
+    );
+  };
+  headlightMaterial.customProgramCacheKey = () => 'vehicleLens-v1';
   const tailLightMaterial = new THREE.MeshStandardMaterial({
     name: 'tailLight',
     color: 0x3a0806,
@@ -767,10 +1671,16 @@ function instantiate(bp: Blueprint, livery: Livery): VehicleModel {
   };
   addMesh(bp.paint, paintMat, 'hull', true, true);
   addMesh(bp.kit, kitMaterial(), 'chassisKit', true, true);
-  addMesh(bp.glass, glassMaterial(), 'cockpitGlass', true, false);
-  addMesh(bp.head, headlightMaterial, 'headlights', false, false);
-  addMesh(bp.tail, tailLightMaterial, 'tailLights', false, false);
-  addMesh(bp.accent, accentMaterial, 'accentLights', false, false);
+  addMesh(bp.head, headlightMaterial, 'headlights', true, false);
+  addMesh(bp.tail, tailLightMaterial, 'tailLights', true, false);
+  addMesh(bp.accent, accentMaterial, 'accentLights', true, false);
+  if (bp.glass) {
+    const glass = new THREE.Mesh(bp.glass, glassMaterial());
+    glass.name = 'cockpitGlass';
+    glass.castShadow = true;
+    glass.renderOrder = 2;
+    body.add(glass);
+  }
 
   const muzzles: THREE.Object3D[] = [];
   let turret: THREE.Object3D | undefined;
@@ -778,6 +1688,7 @@ function instantiate(bp: Blueprint, livery: Livery): VehicleModel {
     const mesh = new THREE.Mesh(bp.turret.geo, kitMaterial());
     mesh.name = 'turret';
     mesh.castShadow = true;
+    mesh.receiveShadow = true;
     mesh.position.set(bp.turret.p[0], bp.turret.p[1], bp.turret.p[2]);
     bp.turret.muzzles.forEach((s, i) => {
       const socket = makeSocket(`muzzleTurret${i}`, s);
@@ -819,17 +1730,38 @@ function instantiate(bp: Blueprint, livery: Livery): VehicleModel {
     wheels.push(mesh);
   }
 
+  const breakaway: { mesh: THREE.Mesh; at: number }[] = [];
+  for (const ex of bp.extras ?? []) {
+    const mesh = new THREE.Mesh(ex.geo, kitMaterial());
+    mesh.name = ex.name;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    if (ex.p) mesh.position.set(ex.p[0], ex.p[1], ex.p[2]);
+    const parent = ex.parent === 'body' ? body : ex.parent === 'root' ? root : ex.parent === 'turret' ? (turret ?? body) : (steerPivots[ex.parent] ?? root);
+    parent.add(mesh);
+    if (ex.hideAt !== undefined) breakaway.push({ mesh, at: ex.hideAt });
+  }
+
   const baseRoughness = paintMat.roughness;
   const physical = paintMat instanceof THREE.MeshPhysicalMaterial ? paintMat : null;
   const baseClearcoat = physical ? physical.clearcoat : 0;
+  const baseEnv = paintMat.envMapIntensity;
   const pristine = new THREE.Color(1, 1, 1);
-  const scorched = new THREE.Color(0.3, 0.2, 0.15);
+  const scorched = new THREE.Color(0.62, 0.55, 0.5);
+  let applied = -1;
   const setDamage = (level: number): void => {
-    const t = Math.min(1, Math.max(0, level));
+    const t = Number.isFinite(level) ? Math.min(1, Math.max(0, level)) : 0;
+    if (t === applied) return;
+    applied = t;
+    // the shader reveals scrapes + soot from the wear masks; these cheap params follow along
+    livery.damage.value = t;
     paintMat.color.lerpColors(pristine, scorched, t);
-    paintMat.roughness = lerp(baseRoughness, livery.scorchRoughness, t);
-    if (physical) physical.clearcoat = Math.max(0.04, baseClearcoat * (1 - t));
+    paintMat.roughness = lerp(baseRoughness, livery.scorchRoughness, t * t);
+    paintMat.envMapIntensity = baseEnv * (1 - 0.45 * t);
+    if (physical) physical.clearcoat = Math.max(0.03, baseClearcoat * (1 - t));
+    for (const part of breakaway) part.mesh.visible = t < part.at;
   };
+  setDamage(0);
 
   const materials = new Set<THREE.Material>();
   let meshes = 0;
@@ -871,14 +1803,52 @@ function finishBody(a: Asm, dustTop: number, dustAmount: number): Pick<Blueprint
   return { paint: paintGeo, kit, glass: a.build('glass'), head: a.build('head'), tail: a.build('tail'), accent: a.build('accent') };
 }
 
-function scatterBolts(a: Asm, pts: V3[], size: number, outward: V3, lk: Look): void {
-  const q = new THREE.Quaternion().setFromUnitVectors(AXIS_Z, outward.clone().normalize());
-  for (const p of pts) {
-    const g = box(size, size, size * 0.6);
-    g.applyQuaternion(q);
-    g.translate(p.x, p.y, p.z);
-    a.add('kit', g, lk);
+function scatterBolts(a: Asm, pts: V3[], size: number, outward: V3, lk: Look, bucket = 'kit'): void {
+  a.add(bucket, rivets(pts, size, outward), lk);
+}
+
+/** Hazard-striped panel: the quad (p0 -> p1 along the stripe run, p3 -> p2 opposite edge) cut into slanted bands. */
+function hazardPanel(a: Asm, bucket: string, quad: [V3, V3, V3, V3], bands: number, slant: number, cA: number, cB: number, t: number, outward: V3, mirror = false): void {
+  const [p0, p1, p2, p3] = quad;
+  for (let i = 0; i < bands; i++) {
+    const u0 = i / bands;
+    const u1 = (i + 1) / bands;
+    const lo0 = p0.clone().lerp(p1, clamp01(u0 - slant));
+    const lo1 = p0.clone().lerp(p1, clamp01(u1 - slant));
+    const hi0 = p3.clone().lerp(p2, clamp01(u0 + slant));
+    const hi1 = p3.clone().lerp(p2, clamp01(u1 + slant));
+    if (lo0.distanceTo(lo1) < 1e-4 && hi0.distanceTo(hi1) < 1e-4) continue;
+    const g = plate([lo0, lo1, hi1, hi0], t, outward);
+    if (mirror) a.addM(bucket, g, paint(i % 2 === 0 ? cA : cB, 0.06));
+    else a.add(bucket, g, paint(i % 2 === 0 ? cA : cB, 0.06));
   }
+}
+
+/** Hand-painted glyphs as flat decals in the XY plane (facing +Z), roughly unit sized. */
+function glyph(kind: 'claw' | 'eye' | 'bolt' | 'cross' | 'fang'): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [];
+  const poly = (pts: P2[]): void => {
+    parts.push(decal(pts.map(([x, y]) => v(x, y, 0)), AXIS_Z));
+  };
+  if (kind === 'claw') {
+    for (let i = -1; i <= 1; i++) poly([[i * 0.3 - 0.2, 0.5], [i * 0.3 - 0.06, 0.52], [i * 0.3 + 0.18, -0.44], [i * 0.3 + 0.12, -0.5]]);
+  } else if (kind === 'eye') {
+    poly([[-0.5, 0], [0, 0.26], [0, 0.14], [-0.3, 0]]);
+    poly([[0.5, 0], [0, 0.26], [0, 0.14], [0.3, 0]]);
+    poly([[-0.5, 0], [-0.3, 0], [0, -0.14], [0, -0.26]]);
+    poly([[0.5, 0], [0.3, 0], [0, -0.14], [0, -0.26]]);
+    poly([[-0.09, 0], [0, 0.1], [0.09, 0], [0, -0.1]]);
+  } else if (kind === 'bolt') {
+    poly([[0.1, 0.5], [-0.24, -0.04], [0.0, -0.02], [0.3, 0.5]]);
+    poly([[-0.02, 0.06], [-0.14, -0.5], [0.24, 0.08], [0.02, 0.04]]);
+  } else if (kind === 'cross') {
+    poly([[-0.5, 0.38], [-0.38, 0.5], [0.5, -0.38], [0.38, -0.5]]);
+    poly([[0.5, 0.38], [0.38, 0.5], [-0.5, -0.38], [-0.38, -0.5]]);
+  } else {
+    for (let i = -2; i <= 2; i++) poly([[i * 0.2 - 0.09, 0.3], [i * 0.2 + 0.09, 0.3], [i * 0.2, -0.3 + Math.abs(i) * 0.1]]);
+  }
+  const g = mergeGeometries(parts, false) as THREE.BufferGeometry;
+  return g;
 }
 
 // ---------------------------------------------------------------- faction skull plate (raiders)
@@ -915,170 +1885,614 @@ function addSkull(a: Asm, boneLook: Look): void {
   a.add('accent', box(0.34, 0.32, 0.014), paint(0xffffff, 0), { p: [0.23, 0.1, 0.02] });
   a.add('accent', box(0.34, 0.32, 0.014), paint(0xffffff, 0), { p: [-0.23, 0.1, 0.02] });
   a.add('kit', box(0.16, 0.18, 0.014), L.matte, { p: [0, -0.14, 0.02] });
-  // brow ridge + cheek rivets give the plate a welded, hand-cut feel
+  // brow ridge, cheek rivets and a cracked forehead give the plate a welded, hand-cut feel
   a.addM('kit', beam(v(0.06, 0.2, 0.06), v(0.44, 0.34, 0.06), 0.05, 0.03), L.rustDark);
-  scatterBolts(a, [v(0.4, -0.08, 0.05), v(-0.4, -0.08, 0.05), v(0.25, 0.47, 0.05), v(-0.25, 0.47, 0.05)], 0.035, AXIS_Z, L.steelDark);
+  a.add('kit', decal([v(0.02, 0.58, 0.052), v(0.05, 0.4, 0.052), v(-0.03, 0.3, 0.052), v(-0.01, 0.42, 0.052)], AXIS_Z), L.matte);
+  scatterBolts(a, [v(0.4, -0.08, 0.05), v(-0.4, -0.08, 0.05), v(0.25, 0.47, 0.05), v(-0.25, 0.47, 0.05), v(0.43, 0.2, 0.05), v(-0.43, 0.2, 0.05)], 0.04, AXIS_Z, L.steelDark);
 }
 
 // ---------------------------------------------------------------- HERO: interceptor
 
-const HERO_HALF_W = 0.92;
-const heroSideX = (y: number, z: number): number => {
-  const tz = 1 - 0.1 * sm(1.55, 2.33, z) - 0.06 * sm(-1.7, -2.32, z);
-  const ty = 1 - 0.045 * sm(0.8, 1.12, y) - 0.05 * sm(0.52, 0.3, y);
-  return HERO_HALF_W * tz * ty;
+const HERO_W = 0.92;
+const HERO_WR = 0.42;
+const HERO_FZ = 1.42;
+const HERO_RZ = -1.38;
+const HERO_CAB = 0.425;
+const HERO_COWL = 0.68;
+const HERO_HEAD = 0.1;
+const HERO_ROOF_END = -0.72;
+const HERO_GLASS_END = -1.78;
+
+const heroTopY = curve1([
+  [-2.22, 1.15],
+  [-2.0, 1.128],
+  [-1.78, 1.105],
+  [-1.35, 1.085],
+  [-0.9, 1.045],
+  [0.62, 1.03],
+  [1.3, 1.0],
+  [1.85, 0.95],
+  [2.1, 0.905],
+  [2.22, 0.87],
+]);
+const heroCabH = lin([
+  [HERO_GLASS_END, 0],
+  [HERO_ROOF_END, HERO_CAB],
+  [HERO_HEAD, HERO_CAB],
+  [HERO_COWL, 0],
+]);
+/** Plan-view half width: tapered nose and tail, pinched waist at the doors. */
+const heroW = (z: number): number => HERO_W * (1 - 0.1 * sm(1.55, 2.33, z) - 0.06 * sm(-1.7, -2.32, z)) * (1 - 0.035 * Math.exp(-(((z + 0.02) / 0.5) ** 2)));
+function heroRib(z: number): Rib {
+  const w = heroW(z);
+  const h = heroCabH(z);
+  const gb = Math.min(0.83, w * 0.9);
+  return { zt: z, zb: z, yt: heroTopY(z), yb: 0.3, w, h, gb, gt: gb - (gb - 0.664) * (h / HERO_CAB) };
+}
+const HERO_SHAPE = {
+  arches: [
+    { cz: HERO_FZ, cy: HERO_WR, r: 0.5, bulge: 0.05 },
+    { cz: HERO_RZ, cy: HERO_WR, r: 0.5, bulge: 0.065 },
+  ] as Arch[],
+  xTub: 0.5,
+  crown: 0.035,
 };
-/** Greenhouse half width at height y (tumblehome). */
-const heroGlassX = (y: number): number => 0.83 * (1 - 0.2 * sm(1.0, 1.45, y));
 
-let heroBlueprint: Blueprint | null = null;
+/** Body-side half width at height y for station z (follows fender bulges and the waist). */
+function heroSideX(y: number, z: number): number {
+  const spec = { ...HERO_SHAPE, lo: false, ribs: [], cell: () => 1, label: '' } as LoftSpec;
+  const rib = heroRib(z);
+  const p = new THREE.Vector3();
+  let px = 0;
+  let py = 0;
+  for (let id = RID.SL; id <= RID.BT; id++) {
+    ribPoint(spec, rib, id, p);
+    if (y <= p.y) return id === RID.SL || p.y - py < 1e-5 ? p.x : lerp(px, p.x, (y - py) / (p.y - py));
+    px = p.x;
+    py = p.y;
+  }
+  return px;
+}
+const heroDeckY = (x: number, z: number): number => heroTopY(z) - HERO_SHAPE.crown * (x / heroW(z)) ** 2;
 
-function buildHero(): Blueprint {
-  const a = new Asm(11);
-  const WR = 0.42;
-  const FZ = 1.42;
-  const RZ = -1.38;
-  const stripeRand = rng(77);
+function heroLoftSpec(): LoftSpec {
+  const zs: number[] = [];
+  const add = (z: number, tol: number): void => {
+    if (z < -2.0 || z > 2.1) return;
+    for (const e of zs) if (Math.abs(e - z) < tol) return;
+    zs.push(z);
+  };
+  for (const z of [HERO_COWL, HERO_COWL - 0.045, HERO_HEAD + 0.045, HERO_HEAD, -0.36, -0.44, HERO_ROOF_END, HERO_ROOF_END - 0.04, -1.08, HERO_GLASS_END + 0.04, HERO_GLASS_END, -2.0, 2.1]) add(z, 0.001);
+  for (const arch of HERO_SHAPE.arches) {
+    const dz = Math.sqrt(arch.r * arch.r - (arch.cy - 0.3) ** 2);
+    add(arch.cz - dz, 0.02);
+    add(arch.cz + dz, 0.02);
+    for (let k = 1; k < 12; k++) add(arch.cz + arch.r * Math.cos((k * Math.PI) / 12), 0.022);
+  }
+  for (let z = -2.0; z <= 2.1; z += 0.12) add(z, 0.07);
+  zs.sort((p, q) => p - q);
+  const ribs = zs.map(heroRib);
+  const cap = (zt: number, yt: number, zb: number, yb: number): Rib => {
+    const w = heroW((zt + zb) / 2) * (Math.abs(yt - yb) < 0.05 ? 0.93 : 1);
+    const gb = w * 0.9;
+    return { zt, yt, zb, yb, w, h: 0, gb, gt: gb };
+  };
+  // raked nose and tail faces: ribs whose top and bottom sit at different z, closed by a collapsed "bumper line" rib
+  ribs.unshift(cap(-2.318, 0.805, -2.318, 0.8), cap(-2.3, 1.13, -2.17, 0.36), cap(-2.22, 1.15, -2.05, 0.3));
+  ribs.push(cap(2.22, 0.87, 2.16, 0.3), cap(2.29, 0.8, 2.27, 0.4), cap(2.318, 0.605, 2.318, 0.6));
+  const nr = ribs.length;
+  const mid = (i: number): number => (ribs[i].zt + ribs[i + 1].zt) / 2;
+  return {
+    ...HERO_SHAPE,
+    ribs,
+    lo: false,
+    label: 'hero.hull',
+    hardIds: [RID.CH],
+    hardRibs: [1, nr - 2],
+    creaseAngle: 0.62,
+    cell: (i, a, b) => {
+      const z = mid(i);
+      if (a >= RID.RI) {
+        if (z > HERO_HEAD + 0.045 && z < HERO_COWL - 0.045) return 2; // windshield
+        if (z > HERO_GLASS_END + 0.04 && z < HERO_ROOF_END - 0.04) return 2; // rear window (under the louvres)
+        return 1;
+      }
+      if (a === RID.WB && b === RID.WT) {
+        if (z > -0.36 && z < HERO_COWL - 0.045) return 2; // door glass + front quarter
+        if (z > -1.08 && z < -0.44) return 2; // rear quarter window
+      }
+      return 1;
+    },
+    warp: (p, _i, id) => {
+      const xn = p.x / HERO_W;
+      if (p.z > 1.9) p.z -= 0.1 * xn * xn * sm(1.9, 2.25, p.z);
+      if (p.z < -1.9) p.z += 0.06 * xn * xn * sm(-1.9, -2.2, p.z);
+      // bowed windshield / roof header
+      if (id >= RID.GB) p.z -= 0.1 * xn * xn * sm(-0.4, 0.1, p.z) * (1 - sm(HERO_COWL, 1.2, p.z));
+    },
+  };
+}
 
-  // --- lower hull: side-profile extrusion with bevel, then tapered / crowned
-  const profile: P2[] = [
-    [2.16, 0.3],
-    [2.27, 0.4],
-    [2.31, 0.62],
-    [2.29, 0.8],
-    [2.22, 0.87],
-    [1.85, 0.95],
-    [1.3, 1.0],
-    [0.62, 1.03],
-    [-0.9, 1.04],
-    [-1.35, 1.09],
-    [-1.85, 1.11],
-    [-2.22, 1.15],
-    [-2.3, 1.13],
-    [-2.29, 0.98],
-    [-2.24, 0.62],
-    [-2.17, 0.36],
-    [-2.05, 0.3],
-    ...archPts(RZ, WR, 0.5, 0.3, 9),
-    ...archPts(FZ, WR, 0.5, 0.3, 9),
+/** Point on the windshield plane: x across, t = 0 at the cowl .. 1 at the header, `off` metres off the glass. */
+const heroWindshield = (x: number, t: number, off: number): V3 => {
+  const xn = x / HERO_W;
+  return v(x, 1.03 + HERO_CAB * t - 0.035 * xn * xn + 0.807 * off, HERO_COWL - (HERO_COWL - HERO_HEAD) * t - 0.1 * xn * xn + 0.591 * off);
+};
+
+/** 7-segment stencil digit: lx 0..1 across, ly 0..1 up. */
+function seg7(digit: number, lx: number, ly: number): boolean {
+  if (lx < 0.12 || lx > 0.88 || ly < 0.04 || ly > 0.96) return false;
+  const on = ['abcdef', 'bc', 'abged', 'abgcd', 'fgbc', 'afgcd', 'afgedc', 'abc', 'abcdefg', 'abcdfg'][digit] ?? '';
+  const t = 0.17;
+  const left = lx < 0.12 + t;
+  const right = lx > 0.88 - t;
+  const top = ly > 0.96 - t * 0.6;
+  const bot = ly < 0.04 + t * 0.6;
+  const midY = Math.abs(ly - 0.5) < t * 0.3;
+  const upper = ly > 0.5;
+  return (
+    (top && on.includes('a')) ||
+    (right && upper && on.includes('b')) ||
+    (right && !upper && on.includes('c')) ||
+    (bot && on.includes('d')) ||
+    (left && !upper && on.includes('e')) ||
+    (left && upper && on.includes('f')) ||
+    (midY && on.includes('g'))
+  );
+}
+
+const segDist = (px: number, py: number, ax: number, ay: number, bx: number, by: number): number => {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const t = clamp01(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy || 1));
+  return Math.hypot(px - ax - dx * t, py - ay - dy * t);
+};
+
+/**
+ * Paints the interceptor's unwrapped hull: sun-faded gunmetal, chipped burnt-orange stripe, stencils,
+ * panel gaps, rivet rows, rust blooms at edges, dust on the lower body and tail, scratches.
+ * Returns albedo (A = scorch field), ORM-style (R = scrape field, G = roughness, B = metalness) and a normal map.
+ */
+function buildHeroTextures(lo: LoftOut): { albedo: THREE.DataTexture; orm: THREE.DataTexture; normal: THREE.DataTexture } {
+  const W = 1024;
+  const H = 512;
+  const { P, N, nr, nq, u, vv } = lo;
+  const colI = new Int32Array(W);
+  const colT = new Float32Array(W);
+  for (let x = 0, i = 0; x < W; x++) {
+    const uu = (x + 0.5) / W;
+    while (i < nr - 2 && u[i + 1] < uu) i++;
+    colI[x] = i;
+    colT[x] = clamp01((uu - u[i]) / Math.max(1e-6, u[i + 1] - u[i]));
+  }
+  const rowQ = new Int32Array(H);
+  const rowS = new Float32Array(H);
+  for (let y = 0, q = 0; y < H; y++) {
+    const v0 = (y + 0.5) / H;
+    while (q < nq - 2 && vv[q + 1] < v0) q++;
+    rowQ[y] = q;
+    rowS[y] = clamp01((v0 - vv[q]) / Math.max(1e-6, vv[q + 1] - vv[q]));
+  }
+  const S = 256;
+  const nA = fbmField(S, [[4, 0.5], [9, 0.3], [20, 0.2]], 301);
+  const nB = fbmField(S, [[18, 0.4], [44, 0.35], [100, 0.25]], 302);
+  const nC = fbmField(S, [[6, 0.5], [14, 0.3], [40, 0.2]], 303);
+
+  const sideLines: [number, number, number, number][] = [
+    [0.56, 0.36, 0.57, 1.0],
+    [-0.5, 0.36, -0.53, 1.02],
+    [0.56, 0.36, -0.5, 0.36],
+    [1.99, 0.33, 2.03, 0.9],
+    [-1.95, 0.33, -1.99, 1.1],
+    [-1.62, 0.99, -1.48, 0.99],
+    [-1.62, 1.07, -1.48, 1.07],
+    [-1.62, 0.99, -1.62, 1.07],
+    [-1.48, 0.99, -1.48, 1.07],
   ];
-  let hull = profileX(profile, HERO_HALF_W * 2, 0.03, 14, 2);
-  colorTris(hull, (cen, nor) => {
-    const top = Math.abs(nor.x) < 0.5 && nor.y > -0.3;
-    if (top && cen.x > 0.25 && cen.x < 0.51) return stripeRand() < 0.1 ? C.orangeWorn : C.orange;
-    if (top && cen.x > 0.13 && cen.x < 0.25 && cen.z < 0.7 && cen.z > -2.0) return C.gunmetalDark;
-    if (Math.abs(nor.x) > 0.9 && cen.y < 0.52) return C.gunmetalDark;
-    return C.gunmetal;
-  });
-  deform(hull, (p) => {
-    const xn = p.x / HERO_HALF_W;
-    const side = heroSideX(p.y, p.z) / HERO_HALF_W;
-    if (p.y > 0.7) p.y += 0.035 * (1 - xn * xn);
-    if (p.z > 1.9) p.z -= 0.1 * xn * xn * sm(1.9, 2.25, p.z);
-    if (p.z < -1.9) p.z += 0.06 * xn * xn * sm(-1.9, -2.2, p.z);
-    p.x *= side;
-  });
-  hull = toCreasedNormals(hull, 0.62);
-  a.add('paint', hull, paint(C.gunmetal));
-
-  // dark structural core fills the wheel tunnels and the underside
-  a.add('kit', box(1.34, 0.64, 4.2), L.matte, { p: [0, 0.6, 0] });
-  a.add('kit', box(1.5, 0.1, 1.4), L.matte, { p: [0, 0.33, 0] });
-
-  // --- fender flares (annular arcs, flared lip)
-  a.addM('paint', archFlare(0.485, 0.595, 0.36, 0.2), paint(C.gunmetalDark), { p: [0.84, WR, FZ] });
-  a.addM('paint', archFlare(0.485, 0.615, 0.4, 0.2), paint(C.gunmetalDark), { p: [0.84, WR, RZ] });
-
-  // --- greenhouse (tinted glass volume) + painted roof, pillars, sail panels
-  const glassProfile: P2[] = [
-    [0.68, 1.0],
-    [0.1, 1.445],
-    [-0.72, 1.455],
-    [-1.78, 1.1],
-    [-1.78, 1.0],
+  const topLines: [number, number, number, number][] = [
+    [0.76, 0.72, 0.74, 2.08],
+    [0, 2.1, 0.74, 2.08],
+    [0, 0.72, 0.76, 0.72],
+    [0.64, -1.82, 0.62, -2.21],
+    [0, -1.82, 0.64, -1.82],
+    [0, -2.21, 0.62, -2.21],
   ];
-  const glass = profileX(glassProfile, 1.66, 0, 4);
-  deform(glass, (p) => {
-    const xn = p.x / 0.83;
-    p.z -= 0.1 * xn * xn * sm(-0.4, 0.1, p.z);
-    p.x *= heroGlassX(p.y) / 0.83;
-  });
-  a.add('glass', glass, paint(0xffffff, 0));
 
-  const roofProfile: P2[] = [
-    [0.17, 1.435],
-    [0.11, 1.48],
-    [-0.74, 1.49],
-    [-0.82, 1.45],
-  ];
-  let roof = profileX(roofProfile, 1.37, 0.012, 10, 1);
-  colorTris(roof, (cen, nor) => (Math.abs(nor.x) < 0.5 && cen.x > 0.26 && cen.x < 0.54 ? C.orange : C.gunmetal));
-  deform(roof, (p) => {
-    const xn = p.x / 0.685;
-    p.z -= 0.1 * xn * xn * sm(-0.4, 0.1, p.z);
-    p.y += 0.012 * (1 - xn * xn);
-  });
-  roof = toCreasedNormals(roof, 0.6);
-  a.add('paint', roof, paint(C.gunmetal));
+  const albedo = new Uint8Array(W * H * 4);
+  const orm = new Uint8Array(W * H * 4);
+  const height = new Float32Array(W * H);
+  const GM = [0.204, 0.227, 0.255];
+  const GMD = [0.1, 0.108, 0.12];
+  const OR = [0.78, 0.33, 0.09];
+  const ORW = [0.56, 0.29, 0.13];
+  const DUST = [0.6, 0.45, 0.3];
+  const RUST = [0.45, 0.23, 0.12];
+  const RUSTD = [0.24, 0.14, 0.095];
+  const BONE = [0.8, 0.76, 0.64];
+  const col = [0, 0, 0];
+  const mixTo = (c: number[], k: number, s = 1): void => {
+    col[0] = lerp(col[0], c[0] * s, k);
+    col[1] = lerp(col[1], c[1] * s, k);
+    col[2] = lerp(col[2], c[2] * s, k);
+  };
+  const V_SL = RING_V[RID.SL];
+  const V_BT = RING_V[RID.BT];
+  const nc = nq - 1;
+  for (let py = 0; py < H; py++) {
+    const q = rowQ[py];
+    const s = rowS[py];
+    const v0 = (py + 0.5) / H;
+    const vh = v0 < 0.5 ? v0 : 1 - v0;
+    const under = vh < V_SL;
+    const inboard = vh >= V_BT;
+    for (let px = 0; px < W; px++) {
+      const i = colI[px];
+      const t = colT[px];
+      const a = (i * nq + q) * 3;
+      const b = ((i + 1) * nq + q) * 3;
+      const c = (i * nq + q + 1) * 3;
+      const d = ((i + 1) * nq + q + 1) * 3;
+      const bl = (k: number): number => lerp(lerp(P[a + k], P[b + k], t), lerp(P[c + k], P[d + k], t), s);
+      const x = bl(0);
+      const y = bl(1);
+      const z = bl(2);
+      const ny = N[(i * nc + q) * 3 + 1];
+      const n1 = fieldAt(nA, S, px * 0.25, py * 0.5);
+      const n2 = fieldAt(nB, S, px * 0.9, py * 1.8);
+      const n3 = fieldAt(nB, S, px * 0.31 + 70, py * 0.62 + 19);
+      const n4 = fieldAt(nA, S, px * 0.6 + 11, py * 1.2 + 140);
+      const topness = sm(0.35, 0.9, ny);
+      let rough = 0.4;
+      let metal = 0.62;
+      let hgt = 0;
+      let edge = 0;
+      let groove = 0;
+      let scrape = 0;
+      const tone = 0.8 + 0.4 * n1;
+      col[0] = GM[0] * tone;
+      col[1] = GM[1] * tone;
+      col[2] = GM[2] * tone;
+      // sun fade: chalky and lighter where the paint faces the sky
+      mixTo([0.34, 0.345, 0.34], topness * (0.22 + 0.34 * n3));
+      rough += 0.16 * topness;
+      if (under) {
+        col[0] = 0.034;
+        col[1] = 0.032;
+        col[2] = 0.03;
+        rough = 0.95;
+        metal = 0.05;
+      } else {
+        if (!inboard) {
+          // two-tone lower body + worn rocker pinstripe
+          if (y < 0.5 + 0.02 * (n2 - 0.5)) {
+            mixTo(GMD, 1, 0.8 + 0.4 * n1);
+            rough = 0.58;
+          }
+          if (y > 0.535 && y < 0.572 && Math.abs(z) < 2.02 && n2 * 0.6 + n3 * 0.4 < 0.62) mixTo(ORW, 1, 0.9 + 0.3 * n1);
+          for (const [z0, y0, z1, y1] of sideLines) {
+            const dl = segDist(z, y, z0, y0, z1, y1);
+            groove = Math.max(groove, 1 - sm(0.0035, 0.01, dl));
+            edge = Math.max(edge, 1 - sm(0, 0.09, dl));
+          }
+          for (const arch of HERO_SHAPE.arches) edge = Math.max(edge, 1 - sm(0, 0.08, Math.abs(Math.hypot(z - arch.cz, y - arch.cy) - arch.r)));
+          edge = Math.max(edge, 1 - sm(0.3, 0.4, y));
+          // sill rivet row
+          if (z > -0.82 && z < 0.9) {
+            const lz = ((z % 0.15) + 0.15) % 0.15 - 0.075;
+            const rv = 1 - sm(0.006, 0.012, Math.hypot(lz, y - 0.345));
+            if (rv > 0) {
+              mixTo([col[0] * 1.6 + 0.05, col[1] * 1.6 + 0.05, col[2] * 1.6 + 0.05], rv);
+              hgt += 1.1 * rv;
+            }
+          }
+        } else {
+          const ax = Math.abs(x);
+          // burnt-orange offset stripe with chipped edges, dark keyline and pinstripe
+          const chipA = (n2 - 0.5) * 0.034;
+          const chipB = (n4 - 0.5) * 0.03;
+          const holes = n3 * 0.55 + n2 * 0.45 > 0.68;
+          if (x > 0.25 + chipA && x < 0.51 + chipB) {
+            if (holes) mixTo([0.3, 0.29, 0.28], 0.85);
+            else {
+              mixTo(OR, 1, 0.86 + 0.28 * n1);
+              mixTo(ORW, 0.55 * n3 + 0.25 * topness);
+              rough = 0.46 + 0.14 * topness;
+              metal = 0.3;
+            }
+          } else if (x > 0.555 + chipB && x < 0.59 + chipA && !holes) {
+            mixTo(ORW, 1, 0.9 + 0.3 * n1);
+            metal = 0.3;
+          } else if (x > 0.2 + chipB && x < 0.235) mixTo(GMD, 0.9);
+          // stencilled unit number: roof (reads from the chase camera) and hood (reads from the front)
+          let stencil = false;
+          if (z > -0.52 && z < -0.16 && x < -0.3 && x > -0.58) {
+            const gx = (-0.3 - x) / 0.14;
+            stencil = seg7(gx < 1 ? 0 : 7, gx % 1, (z + 0.52) / 0.36);
+          } else if (z > 1.3 && z < 1.84 && x > -0.64 && x < -0.24) {
+            const gx = (x + 0.64) / 0.2;
+            stencil = seg7(gx < 1 ? 0 : 7, gx % 1, (1.84 - z) / 0.54);
+          }
+          if (stencil && n2 * 0.5 + n4 * 0.5 < 0.6) {
+            mixTo(BONE, 0.92, 0.85 + 0.2 * n1);
+            metal = 0.1;
+            rough = 0.62;
+          }
+          for (const [x0, z0, x1, z1] of topLines) {
+            const dl = segDist(ax, z, x0, z0, x1, z1);
+            groove = Math.max(groove, 1 - sm(0.0035, 0.01, dl));
+            edge = Math.max(edge, 1 - sm(0, 0.08, dl));
+          }
+          // rivet rows: hood edges, roof header and tail of the roof
+          let dr = 1;
+          if (z > 0.8 && z < 2.02) dr = Math.hypot(((z % 0.13) + 0.13) % 0.13 - 0.065, ax - 0.815);
+          if (ax < 0.56 && z < 0.2) {
+            const lx = ((ax % 0.11) + 0.11) % 0.11 - 0.055;
+            dr = Math.min(dr, Math.hypot(lx, z + 0.01), Math.hypot(lx, z + 0.665));
+          }
+          const rv = 1 - sm(0.006, 0.012, dr);
+          if (rv > 0) {
+            mixTo([col[0] * 1.6 + 0.05, col[1] * 1.6 + 0.05, col[2] * 1.6 + 0.05], rv);
+            hgt += 1.1 * rv;
+          }
+        }
+        // hazard band low on the tail face
+        if (z < -2.19 && y > 0.4 && y < 0.6) {
+          const band = Math.floor((x + y * 0.9 + 4) / 0.11) % 2 === 0;
+          if (n2 * 0.5 + n3 * 0.5 < 0.64) {
+            if (band) mixTo([0.8, 0.58, 0.14], 0.95, 0.85 + 0.3 * n1);
+            else mixTo([0.05, 0.05, 0.05], 0.95);
+            metal = 0.2;
+            rough = 0.6;
+          }
+        }
+        // rust blooms creep out of panel edges, arches and the sill
+        const rustM = sm(0.6, 0.78, 0.5 * n3 + 0.28 * n2 + 0.44 * edge + 0.1 * (1 - n1));
+        if (rustM > 0) {
+          mixTo([lerp(RUSTD[0], RUST[0], n2), lerp(RUSTD[1], RUST[1], n2), lerp(RUSTD[2], RUST[2], n2)], rustM * 0.92);
+          rough = lerp(rough, 0.9, rustM);
+          metal = lerp(metal, 0.2, rustM);
+          hgt -= 0.5 * rustM * n2;
+        }
+        // dust: heavy on the lower body, drifting over the tail, a film on flat tops
+        const dust = Math.min(0.9, 0.95 * sm(0.98, 0.33, y) * (0.25 + 0.95 * n1) + 0.55 * sm(-1.0, -2.3, z) * (0.3 + n3) + 0.2 * topness * n4);
+        mixTo(DUST, dust, 0.85 + 0.3 * n2);
+        rough = lerp(rough, 0.95, dust);
+        metal *= 1 - 0.92 * dust;
+        // panel gaps
+        col[0] *= 1 - 0.9 * groove;
+        col[1] *= 1 - 0.9 * groove;
+        col[2] *= 1 - 0.9 * groove;
+        rough = lerp(rough, 0.92, groove);
+        hgt -= 1.6 * groove;
+        const cs = fieldAt(nC, S, px * 0.3, py * 3.2);
+        const ridge = 1 - Math.abs(2 * cs - 1);
+        scrape = clamp01(Math.pow(ridge, 4) * 0.82 + 0.3 * edge + 0.16 * n2 + 0.22 * sm(1.7, 2.3, Math.abs(z)) + 0.12 * sm(0.62, 0.32, y));
+      }
+      const scorch = clamp01(0.72 * sm(0.22, 0.8, fieldAt(nA, S, px * 0.2 + 40, py * 0.4 + 90)) + 0.16 * n2 + 0.3 * Math.exp(-(((z - 1.25) / 0.8) ** 2)) * topness);
+      const o = (py * W + px) * 4;
+      albedo[o] = Math.round(clamp01(col[0]) * 255);
+      albedo[o + 1] = Math.round(clamp01(col[1]) * 255);
+      albedo[o + 2] = Math.round(clamp01(col[2]) * 255);
+      albedo[o + 3] = Math.round(scorch * 255);
+      orm[o] = Math.round(scrape * 255);
+      orm[o + 1] = Math.round(clamp01(rough + 0.12 * (n2 - 0.5)) * 255);
+      orm[o + 2] = Math.round(clamp01(metal) * 255);
+      orm[o + 3] = 255;
+      height[py * W + px] = hgt + 0.25 * n2 + 0.5 * n1;
+    }
+  }
+  // scratches: bare-metal strokes, mostly along the travel direction
+  const rand = rng(4711);
+  for (let k = 0; k < 240; k++) {
+    let x = rand() * W;
+    let y = (0.05 + rand() * 0.9) * H;
+    const ang = (rand() - 0.5) * 0.5 + (rand() < 0.15 ? 1.2 : 0);
+    const len = 20 + rand() * 150;
+    const deep = rand() < 0.5;
+    for (let t = 0; t < len; t++) {
+      const xi = Math.floor(x);
+      const yi = Math.floor(y);
+      if (xi < 0 || xi >= W || yi < 0 || yi >= H) break;
+      const vh = Math.min((yi + 0.5) / H, 1 - (yi + 0.5) / H);
+      if (vh > V_SL) {
+        const o = (yi * W + xi) * 4;
+        const k2 = deep ? 0.7 : 0.35;
+        for (let ch = 0; ch < 3; ch++) albedo[o + ch] = Math.round(lerp(albedo[o + ch], 132, k2));
+        orm[o] = 255;
+        orm[o + 1] = Math.round(lerp(orm[o + 1], 90, k2));
+        orm[o + 2] = Math.round(lerp(orm[o + 2], 235, k2));
+        height[yi * W + xi] -= deep ? 0.9 : 0.4;
+      }
+      x += Math.cos(ang);
+      y += Math.sin(ang) * 0.5;
+    }
+  }
+  // dents
+  for (let k = 0; k < 18; k++) {
+    const cx = rand() * W;
+    const cy = (0.06 + rand() * 0.88) * H;
+    const rad = 10 + rand() * 26;
+    const depth = 1.2 + rand() * 1.6;
+    const x0 = Math.max(0, Math.floor(cx - rad * 2));
+    const x1 = Math.min(W - 1, Math.ceil(cx + rad * 2));
+    const y0 = Math.max(0, Math.floor(cy - rad));
+    const y1 = Math.min(H - 1, Math.ceil(cy + rad));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const dd = ((x - cx) / (rad * 2)) ** 2 + ((y - cy) / rad) ** 2;
+        if (dd < 1) height[y * W + x] -= depth * (1 - dd) * (1 - dd);
+      }
+    }
+  }
+  return {
+    albedo: dataTexture(albedo, W, H, true, false),
+    orm: dataTexture(orm, W, H, false, false),
+    normal: dataTexture(heightToNormal(height, W, H, 1.5, false), W, H, false, false),
+  };
+}
 
+type HeroBlueprint = Blueprint & { hull: LoftOut };
+let heroBlueprint: HeroBlueprint | null = null;
+let heroTextures: { albedo: THREE.DataTexture; orm: THREE.DataTexture; normal: THREE.DataTexture } | null = null;
+
+function buildHero(): HeroBlueprint {
+  const a = new Asm(11, 'hero');
+  const WR = HERO_WR;
+  const FZ = HERO_FZ;
+  const RZ = HERO_RZ;
   const outX = v(1, 0, 0);
-  const gx = (y: number): number => heroGlassX(y) + 0.004;
-  // A pillar, roof rail, B pillar
-  a.addM('paint', beam(v(gx(1.0), 1.0, 0.58), v(gx(1.445), 1.45, 0.02), 0.075, 0.07, outX), paint(C.gunmetal));
-  a.addM('paint', beam(v(gx(1.45), 1.455, 0.04), v(gx(1.455), 1.462, -0.76), 0.06, 0.06, outX), paint(C.gunmetal));
-  a.addM('paint', beam(v(gx(1.02), 1.02, -0.36), v(gx(1.45), 1.45, -0.42), 0.06, 0.09, outX), paint(C.gunmetalDark));
-  // sail panel (C pillar) leaves a small quarter window
-  a.addM(
-    'paint',
-    plate(
-      [v(gx(1.455), 1.458, -0.72), v(gx(1.1), 1.103, -1.79), v(gx(1.02), 1.02, -1.79), v(gx(1.02), 1.02, -1.12)],
-      0.03,
-      outX,
-    ),
-    paint(C.gunmetal),
-  );
-  // louvred rear window
-  for (let i = 0; i < 6; i++) {
-    const t = (i + 0.5) / 6;
-    const y = 1.455 - 0.355 * t + 0.035;
-    const z = -0.74 - 1.04 * t;
-    const half = heroGlassX(y - 0.03) - 0.06;
-    a.add('kit', box(half * 2, 0.014, 0.2), L.blackMetal, { p: [0, y, z], r: [-0.1, 0, 0] });
-  }
-  a.addM('kit', beam(v(0.6, 1.475, -0.76), v(0.74, 1.125, -1.78), 0.035, 0.05), L.steelDark);
-  a.add('kit', beam(v(0, 1.48, -0.76), v(0, 1.13, -1.78), 0.03, 0.04), L.steelDark);
+  const inX = v(-1, 0, 0);
+  const extras: Extra[] = [];
 
-  // --- nose: grille, four round lamps, bull bar
-  const noseZ = (x: number): number => 2.3 - 0.1 * (x / HERO_HALF_W) ** 2;
-  a.add('kit', box(0.62, 0.17, 0.05), L.matte, { p: [0, 0.71, 2.305] });
-  for (let i = 0; i < 3; i++) a.add('kit', box(0.6, 0.014, 0.02), L.steel, { p: [0, 0.66 + i * 0.05, 2.335] });
-  for (const lx of [0.44, 0.66]) {
-    const z = noseZ(lx);
-    a.addM('kit', cylZ(0.092, 0.1, 0.09, 10), L.steelDark, { p: [lx, 0.71, z + 0.01] });
-    a.addM('head', cylZ(0.055, 0.078, 0.03, 10), L.lens, { p: [lx, 0.71, z + 0.068] });
+  // --- sculpted hull: lofted ribs (tumblehome, shoulder crease, fender bulges, pinched waist, raked nose, fastback)
+  const hull = loftBody(heroLoftSpec());
+  const paintGeo = sanitize(hull.body as THREE.BufferGeometry, 'hero.paint');
+  const glassGeo = sanitize(hull.glass as THREE.BufferGeometry, 'hero.glass');
+  const sx = (y: number, z: number): number => heroSideX(y, z) + 0.002;
+  const roofY = heroTopY(-0.3) + HERO_CAB + 0.022;
+
+  // --- dark interior behind the tinted glass: floor, dash, seats, harness, wheel, cage
+  const trim = look(0x0c0c0d, 0.85, 0.05, 0.04);
+  a.add('kit', box(1.5, 0.04, 2.5), trim, { p: [0, 0.47, -0.55] });
+  a.add('kit', box(1.56, 0.22, 0.34), trim, { p: [0, 0.94, 0.56] });
+  a.add('kit', box(0.5, 0.05, 0.2), look(0x1d1f22, 0.5, 0.4, 0), { p: [0.38, 1.06, 0.5], r: [0.5, 0, 0] });
+  a.add('kit', box(1.4, 0.04, 0.7), trim, { p: [0, 1.02, -1.35] });
+  a.add('kit', box(0.26, 0.3, 1.5), trim, { p: [0, 0.62, -0.1] });
+  for (const s of [1, -1]) {
+    const seatLook = L.leather;
+    a.add('kit', box(0.46, 0.12, 0.48), seatLook, { p: [s * 0.4, 0.6, 0.0] });
+    a.add('kit', box(0.44, 0.62, 0.11), seatLook, { p: [s * 0.4, 0.95, -0.27], r: [-0.17, 0, 0] });
+    a.add('kit', box(0.07, 0.5, 0.2), seatLook, { p: [s * 0.4 + 0.22, 0.92, -0.2], r: [-0.17, 0, 0] });
+    a.add('kit', box(0.07, 0.5, 0.2), seatLook, { p: [s * 0.4 - 0.22, 0.92, -0.2], r: [-0.17, 0, 0] });
+    a.add('kit', box(0.25, 0.17, 0.09), seatLook, { p: [s * 0.4, 1.31, -0.34], r: [-0.1, 0, 0] });
+    // harness straps read as colour through the glass
+    for (const hx of [-0.09, 0.09]) a.add('kit', box(0.05, 0.56, 0.012), look(C.orangeWorn, 0.9, 0, 0.05), { p: [s * 0.4 + hx, 0.97, -0.2], r: [-0.17, 0, 0] });
   }
-  // bull bar: wrap-around hoops, uprights, skid plate
+  const wheelXf: Xf = { p: [0.4, 1.06, 0.33], r: [-1.05, 0, 0] };
+  a.add('kit', new THREE.TorusGeometry(0.165, 0.018, 5, 14), look(0x18191b, 0.6, 0.2, 0), wheelXf);
+  a.add('kit', box(0.3, 0.03, 0.02), L.steel, wheelXf);
+  a.add('kit', rod(v(0.4, 1.06, 0.33), v(0.4, 0.92, 0.6), 0.02, 5), L.steelDark);
+  a.add('kit', rod(v(0.02, 0.6, 0.18), v(0.02, 0.86, 0.14), 0.014, 4), L.steel);
+  a.add('kit', weld(v(0.02, 0.88, 0.14), 0.035), look(C.orange, 0.5, 0.1, 0));
+  // roll cage: main hoop, halo, rear stays, door bars, with weld nodes at the joints
+  const cage = look(0x54585d, 0.42, 0.85, 0.06);
+  const hoopZ = -0.5;
+  a.add('kit', tube([v(0.74, 0.5, hoopZ), v(0.72, 1.12, hoopZ), v(0.56, roofY - 0.085, hoopZ), v(-0.56, roofY - 0.085, hoopZ), v(-0.72, 1.12, hoopZ), v(-0.74, 0.5, hoopZ)], 0.028, 6, 3, 0.2), cage);
+  a.addM('kit', tube([v(0.56, roofY - 0.085, hoopZ), v(0.54, roofY - 0.09, 0.02), v(0.7, 1.08, 0.5), v(0.74, 0.52, 0.56)], 0.024, 5, 3, 0.25), cage);
+  a.add('kit', rod(v(-0.54, roofY - 0.09, 0.03), v(0.54, roofY - 0.09, 0.03), 0.022, 5), cage);
+  a.addM('kit', rod(v(0.5, roofY - 0.1, hoopZ), v(0.56, 1.06, -1.55), 0.024, 5), cage);
+  a.addM('kit', rod(v(0.75, 0.62, 0.5), v(0.73, 0.98, hoopZ), 0.022, 5), cage);
+  a.add('kit', rod(v(-0.7, 1.14, hoopZ), v(0.62, 0.56, hoopZ), 0.022, 5), cage);
+  for (const [wx, wy, wz] of [
+    [0.56, roofY - 0.085, hoopZ],
+    [0.54, roofY - 0.09, 0.03],
+    [0.72, 1.12, hoopZ],
+    [0.73, 0.98, hoopZ],
+  ] as T3[]) {
+    a.addM('kit', weld(v(wx, wy, wz), 0.042), L.weld);
+  }
+
+  // --- windshield furniture: wipers, cowl vent, header visor strip
+  for (const [x0, x1] of [
+    [0.52, 0.12],
+    [-0.08, -0.48],
+  ] as P2[]) {
+    a.add('kit', rod(heroWindshield(x0, 0.02, 0.018), heroWindshield(x1, 0.2, 0.014), 0.008, 4), L.matte);
+    a.add('kit', beam(heroWindshield(lerp(x0, x1, 0.45), 0.1, 0.012), heroWindshield(x1, 0.2, 0.01), 0.022, 0.008), L.matte);
+    a.add('kit', weld(heroWindshield(x0, 0.015, 0.012), 0.022), L.steelDark);
+  }
+  for (let i = -3; i <= 3; i++) a.add('kit', box(0.14, 0.008, 0.035), L.matte, { p: [i * 0.18, heroDeckY(i * 0.18, 0.78) + 0.004, 0.78 - 0.1 * ((i * 0.18) / HERO_W) ** 2] });
+
+  // --- mirrors (the driver's one is knocked off by heavy damage), door handles, hood pins
+  const mirror = (s: number, target: Asm): void => {
+    const mx = s * (sx(1.06, 0.5) + 0.1);
+    target.add('kit', rod(v(s * sx(1.06, 0.55), 1.06, 0.56), v(mx, 1.12, 0.53), 0.014, 4), L.steelDark);
+    target.add('kit', box(0.06, 0.11, 0.17), look(C.gunmetalDark, 0.5, 0.6, 0), { p: [mx, 1.14, 0.52] });
+    target.add('kit', box(0.045, 0.085, 0.012), look(0x9aa3ab, 0.08, 1, 0), { p: [mx, 1.14, 0.432] });
+  };
+  mirror(-1, a);
+  const mirrorAsm = new Asm(31, 'hero.mirror');
+  mirror(1, mirrorAsm);
+  extras.push({ name: 'mirrorLeft', geo: mirrorAsm.build('kit') as THREE.BufferGeometry, parent: 'body', hideAt: 0.6 });
+  for (const s of [1, -1]) {
+    a.add('kit', box(0.018, 0.026, 0.13), L.chrome, { p: [s * (sx(1.0, -0.36) + 0.006), 1.0, -0.36] });
+    a.add('kit', cylY(0.011, 0.011, 0.04, 6), L.chrome, { p: [s * 0.5, heroDeckY(0.5, 1.96) + 0.02, 1.96] });
+    a.add('kit', box(0.06, 0.006, 0.05), L.steel, { p: [s * 0.5, heroDeckY(0.5, 1.96) + 0.004, 1.96] });
+    a.add('kit', rod(v(s * 0.5, heroDeckY(0.5, 1.96) + 0.035, 1.96), v(s * 0.56, heroDeckY(0.56, 1.9) + 0.006, 1.9), 0.004, 3), L.steelDark);
+  }
+
+  // --- bolt-on fender flares with rivets, arch liners come from the hull's recessed tubs
+  const flare = look(0x16181a, 0.62, 0.55, 0.05);
+  for (const [cz, lipX, rOut] of [
+    [FZ, HERO_W + 0.05, 0.6],
+    [RZ, HERO_W * 0.99 + 0.065, 0.62],
+  ] as T3[]) {
+    a.addM('kit', archFlare(0.49, rOut, 0.24, 0.18), flare, { p: [lipX - 0.06, WR, cz] });
+    const pts: V3[] = [];
+    for (let i = 0; i < 7; i++) {
+      const ang = lerp(0.1, Math.PI - 0.1, i / 6);
+      pts.push(v(lipX + 0.042, WR + 0.535 * Math.sin(ang), cz + 0.535 * Math.cos(ang)));
+    }
+    scatterBolts(a, pts, 0.026, outX, L.steel);
+    scatterBolts(a, pts.map((p) => v(-p.x, p.y, p.z)), 0.026, inX, L.steel);
+  }
+  // mud flaps behind every wheel
+  for (const [fx, fz] of [
+    [0.87, FZ - 0.55],
+    [0.86, RZ - 0.56],
+  ] as P2[]) {
+    a.addM('kit', box(0.3, 0.3, 0.018), L.rubber, { p: [fx, 0.34, fz], r: [0.12, 0, 0] });
+    a.addM('kit', box(0.3, 0.03, 0.03), L.steelDark, { p: [fx, 0.49, fz + 0.016] });
+  }
+  // rock sliders along the sill
+  a.addM('kit', tube([v(0.9, 0.36, 0.86), v(1.0, 0.33, 0.66), v(1.0, 0.33, -0.62), v(0.9, 0.36, -0.82)], 0.036, 6, 3, 0.25), look(0x2a2c2f, 0.5, 0.8, 0.06));
+  for (const bz of [0.5, 0.0, -0.5]) a.addM('kit', rod(v(0.86, 0.36, bz), v(1.0, 0.33, bz), 0.022, 4), L.steelDark);
+
+  // --- nose: mesh grille with lamps behind the bars, bull bar, tow hooks
+  const noseZ = (x: number, y: number): number => lerp(2.3, 2.318, sm(0.8, 0.62, y)) - 0.1 * (x / HERO_W) ** 2;
+  for (const [gx, gw, ry] of [
+    [0, 0.72, 0],
+    [0.56, 0.44, 0.22],
+    [-0.56, 0.44, -0.22],
+  ] as T3[]) {
+    a.add('kit', box(gw, 0.2, 0.05), L.matte, { p: [gx, 0.7, noseZ(gx, 0.7) + 0.004], r: [0, ry, 0] });
+  }
+  for (const lx of [0.45, 0.66]) {
+    const z = noseZ(lx, 0.7);
+    a.addM('kit', cylZ(0.085, 0.09, 0.05, 10, true), L.steelDark, { p: [lx, 0.7, z + 0.03] });
+    a.addM('head', cylZ(0.06, 0.075, 0.03, 10), L.lens, { p: [lx, 0.7, z + 0.035] });
+  }
+  for (let i = 0; i < 5; i++) {
+    const y = 0.624 + i * 0.038;
+    a.add('kit', tube([v(-0.8, y, noseZ(0.8, y) + 0.05), v(-0.42, y, noseZ(0.42, y) + 0.062), v(0, y, noseZ(0, y) + 0.066), v(0.42, y, noseZ(0.42, y) + 0.062), v(0.8, y, noseZ(0.8, y) + 0.05)], 0.0075, 4, 2, 0.4), L.steel);
+  }
+  for (let i = -6; i <= 6; i++) {
+    const x = i * 0.125;
+    a.add('kit', box(0.012, 0.19, 0.012), L.steelDark, { p: [x, 0.7, noseZ(x, 0.7) + 0.058] });
+  }
+  a.add('kit', box(0.5, 0.05, 0.02), look(C.orange, 0.6, 0.3, 0), { p: [0, 0.84, noseZ(0, 0.84) + 0.012] });
   const barLook = look(0x2a2c2f, 0.5, 0.8, 0.06);
-  a.add(
-    'kit',
-    tube([v(-0.99, 0.74, 1.95), v(-0.84, 0.88, 2.42), v(-0.3, 0.9, 2.5), v(0.3, 0.9, 2.5), v(0.84, 0.88, 2.42), v(0.99, 0.74, 1.95)], 0.034, 6, 3),
-    barLook,
-  );
-  a.add(
-    'kit',
-    tube([v(-0.93, 0.44, 2.05), v(-0.78, 0.44, 2.44), v(-0.3, 0.44, 2.5), v(0.3, 0.44, 2.5), v(0.78, 0.44, 2.44), v(0.93, 0.44, 2.05)], 0.04, 6, 3),
-    barLook,
-  );
+  // upper hoop is its own mesh: it gets torn off when the car is badly hit
+  const bar = new Asm(32, 'hero.bullbar');
+  bar.add('kit', tube([v(-0.99, 0.74, 1.95), v(-0.84, 0.88, 2.42), v(-0.3, 0.9, 2.5), v(0.3, 0.9, 2.5), v(0.84, 0.88, 2.42), v(0.99, 0.74, 1.95)], 0.034, 6, 3), barLook);
+  bar.addM('kit', rod(v(0.84, 0.44, 2.4), v(0.84, 0.88, 2.42), 0.028, 5), barLook);
+  bar.addM('kit', weld(v(0.84, 0.88, 2.42), 0.045), L.weld);
+  extras.push({ name: 'bullBarHoop', geo: bar.build('kit') as THREE.BufferGeometry, parent: 'body', hideAt: 0.75 });
+  a.addM('accent', box(0.07, 0.035, 0.05), paint(0xffffff, 0), { p: [0.6, 0.46, 2.5] });
+  a.add('kit', tube([v(-0.93, 0.44, 2.05), v(-0.78, 0.44, 2.44), v(-0.3, 0.44, 2.5), v(0.3, 0.44, 2.5), v(0.78, 0.44, 2.44), v(0.93, 0.44, 2.05)], 0.04, 6, 3), barLook);
   a.addM('kit', rod(v(0.36, 0.3, 2.44), v(0.36, 0.93, 2.5), 0.036, 6, 0.036, false), barLook);
-  a.addM('kit', rod(v(0.84, 0.44, 2.4), v(0.84, 0.88, 2.42), 0.028, 5), barLook);
+  a.addM('kit', weld(v(0.36, 0.44, 2.5), 0.05), L.weld);
+  a.addM('kit', weld(v(0.36, 0.9, 2.5), 0.046), L.weld);
   a.add('kit', plate([v(-0.36, 0.3, 2.42), v(0.36, 0.3, 2.42), v(0.36, 0.55, 2.5), v(-0.36, 0.55, 2.5)], 0.02, AXIS_Z), L.rustDark);
   for (let i = -2; i <= 2; i++) a.add('kit', box(0.07, 0.15, 0.012), L.matte, { p: [i * 0.13, 0.43, 2.49], r: [-0.3, 0, 0] });
   a.addM('kit', beam(v(0.36, 0.5, 2.26), v(0.36, 0.5, 2.46), 0.05, 0.1), L.steelDark);
-  a.addM('accent', box(0.07, 0.035, 0.05), paint(0xffffff, 0), { p: [0.62, 0.9, 2.47] });
+  const hook = new THREE.TorusGeometry(0.045, 0.014, 5, 8, Math.PI * 1.4);
+  a.addM('kit', hook, look(0xa3271a, 0.5, 0.5, 0), { p: [0.56, 0.36, 2.4], r: [Math.PI / 2, 0, -0.6] });
+  a.add('kit', hook.clone(), look(0xa3271a, 0.5, 0.5, 0), { p: [0.0, 0.38, -2.44], r: [Math.PI / 2, 0, 2.2] });
 
   // --- hood: blower case, belt drive, bug-catcher intake
   const BZ = 1.12;
-  a.add('kit', box(0.5, 0.03, 0.66), L.steelDark, { p: [0, 1.035, BZ] });
+  a.add('kit', box(0.5, 0.03, 0.66), L.steelDark, { p: [0, 1.03, BZ] });
   a.add('kit', box(0.34, 0.15, 0.52), L.alloy, { p: [0, 1.11, BZ] });
   for (let i = 0; i < 6; i++) a.addM('kit', box(0.02, 0.13, 0.03), L.steel, { p: [0.178, 1.11, BZ - 0.21 + i * 0.084] });
   a.add('kit', cylZ(0.085, 0.085, 0.05, 10), L.steelDark, { p: [0, 1.13, BZ + 0.3] });
@@ -1100,95 +2514,127 @@ function buildHero(): Blueprint {
   scoop = toCreasedNormals(scoop, 0.5);
   a.add('kit', scoop, look(0x8b8e92, 0.3, 0.95, 0), { p: [0, 1.185, BZ] });
   a.add('kit', box(0.3, 0.115, 0.02), L.matte, { p: [0, 1.27, BZ + 0.252] });
-  a.add('kit', box(0.012, 0.115, 0.03), L.steel, { p: [0.05, 1.27, BZ + 0.255] });
-  a.add('kit', box(0.012, 0.115, 0.03), L.steel, { p: [-0.05, 1.27, BZ + 0.255] });
+  for (const bx of [-0.1, -0.03, 0.04, 0.11]) a.add('kit', box(0.012, 0.115, 0.03), L.steel, { p: [bx, 1.27, BZ + 0.255] });
   a.add('accent', box(0.2, 0.012, 0.03), paint(0xffffff, 0), { p: [0, 1.35, BZ + 0.2], r: [-0.25, 0, 0] });
+  scatterBolts(a, outlinePts([v(-0.25, 1.046, BZ - 0.33), v(0.25, 1.046, BZ - 0.33), v(0.25, 1.046, BZ + 0.33), v(-0.25, 1.046, BZ + 0.33)], 0.11, 0.03), 0.022, AXIS_Y, L.steel);
+  // hood louvre vents either side of the blower
+  for (const s of [1, -1]) for (let i = 0; i < 4; i++) a.add('kit', box(0.2, 0.012, 0.05), L.matte, { p: [s * 0.56, heroDeckY(0.56, 1.5 - i * 0.09) + 0.008, 1.5 - i * 0.09], r: [-0.35, 0, 0] });
 
-  // --- side exhaust: headers into a lake pipe that kicks out ahead of the rear wheel
-  const pipeLook = look(0x5a4a3c, 0.42, 0.9, 0.08);
-  a.addM('kit', tube([v(0.93, 0.5, 0.86), v(1.0, 0.36, 0.6), v(1.0, 0.34, -0.35), v(1.02, 0.36, -0.62), v(1.08, 0.43, -0.82)], 0.058, 7, 3, 0.3), pipeLook);
-  a.addM('kit', rod(v(1.065, 0.413, -0.77), v(1.095, 0.447, -0.87), 0.066, 8, 0.078), L.steelDark);
-  for (let i = 0; i < 3; i++) a.addM('kit', rod(v(0.88, 0.62, 0.84 - i * 0.13), v(0.99, 0.38, 0.72 - i * 0.16), 0.026, 5), pipeLook);
-  a.addM('kit', box(0.02, 0.1, 0.7), L.blackMetal, { p: [1.065, 0.36, -0.02] });
-  for (let i = 0; i < 5; i++) a.addM('kit', box(0.024, 0.05, 0.05), L.matte, { p: [1.066, 0.36, 0.24 - i * 0.13] });
+  // --- bolted door armour with rivet rows (different each side), driver-side window slat
+  const doorPlate = (s: number): void => {
+    const poly = [v(sx(0.52, 0.4), 0.52, 0.42), v(sx(0.97, 0.4), 0.97, 0.46), v(sx(0.98, -0.3), 0.98, -0.3), v(sx(0.9, -0.42), 0.9, -0.44), v(sx(0.5, -0.42), 0.5, -0.42)].map((p) => v(p.x * s, p.y, p.z));
+    const out = v(s, 0, 0);
+    a.add('kit', plate(poly, 0.022, out), look(0x3d3f42, 0.62, 0.7, 0.05));
+    scatterBolts(a, outlinePts(poly, 0.115, 0.045).map((p) => p.addScaledVector(out, 0.023)), 0.026, out, L.steel);
+  };
+  doorPlate(1);
+  doorPlate(-1);
+  a.add('kit', plate([v(sx(0.6, 0.2) + 0.022, 0.6, 0.2), v(sx(0.9, 0.2) + 0.022, 0.9, 0.26), v(sx(0.88, -0.3) + 0.022, 0.88, -0.3), v(sx(0.56, -0.3) + 0.022, 0.56, -0.26)], 0.018, outX), L.rust);
+  a.add('kit', plate([v(-sx(0.56, -0.02) - 0.022, 0.56, -0.02), v(-sx(0.82, -0.02) - 0.022, 0.82, 0.02), v(-sx(0.84, -0.4) - 0.022, 0.84, -0.4), v(-sx(0.6, -0.4) - 0.022, 0.6, -0.38)], 0.018, inX), L.rustDark);
+  // welded patch on the right rear quarter + kill tally scratched into the left fender
+  const patch = [v(-sx(0.96, -0.72), 0.96, -0.66), v(-sx(1.04, -0.72), 1.04, -0.7), v(-sx(1.03, -1.0), 1.03, -1.02), v(-sx(0.97, -1.0), 0.97, -0.98)];
+  a.add('kit', plate(patch, 0.014, inX), L.rustDark);
+  scatterBolts(a, outlinePts(patch, 0.09, 0.02).map((p) => p.add(v(-0.016, 0, 0))), 0.02, inX, L.steel);
+  for (let i = 0; i < 5; i++) {
+    const tz = 0.98 - i * 0.045;
+    const g = decal([v(0, 0.94, tz), v(0, 0.94, tz - 0.014), v(0, 1.02, tz - 0.024), v(0, 1.02, tz - 0.01)], outX);
+    a.add('kit', g, look(C.bone, 0.8, 0, 0.1), { p: [sx(0.98, tz) + 0.004, 0, 0] });
+  }
+  // window slat armour on the driver side (deliberate asymmetry), still leaves the interior readable
+  const gxAt = (y: number): number => lerp(0.83, 0.664, (y - 1.03) / HERO_CAB) + 0.012;
+  a.add('kit', plate([v(gxAt(1.09), 1.09, 0.4), v(gxAt(1.19), 1.19, 0.28), v(gxAt(1.19), 1.19, -0.3), v(gxAt(1.09), 1.09, -0.3)], 0.016, outX), L.rustDark);
+  scatterBolts(a, [v(gxAt(1.14) + 0.018, 1.14, 0.2), v(gxAt(1.14) + 0.018, 1.14, -0.05), v(gxAt(1.14) + 0.018, 1.14, -0.26)], 0.024, outX, L.steel);
 
-  // --- bolted door armour
-  const sx = (y: number, z: number): number => heroSideX(y, z) + 0.002;
-  a.addM(
-    'kit',
-    plate([v(sx(0.52, 0.4), 0.52, 0.42), v(sx(0.99, 0.4), 0.99, 0.46), v(sx(1.0, -0.3), 1.0, -0.3), v(sx(0.9, -0.7), 0.9, -0.72), v(sx(0.5, -0.7), 0.5, -0.7)], 0.022, outX),
-    look(0x3d3f42, 0.62, 0.7, 0.05),
-  );
-  a.add('kit', plate([v(0.945, 0.6, 0.2), v(0.945, 0.92, 0.26), v(0.945, 0.9, -0.34), v(0.945, 0.56, -0.28)], 0.02, outX), L.rust);
-  a.add('kit', plate([v(-0.945, 0.56, -0.1), v(-0.945, 0.84, -0.06), v(-0.945, 0.86, -0.62), v(-0.945, 0.6, -0.6)], 0.02, v(-1, 0, 0)), L.rustDark);
-  const boltPts: V3[] = [];
-  for (const [by, bz] of [
-    [0.58, 0.34],
-    [0.93, 0.38],
-    [0.94, -0.24],
-    [0.86, -0.64],
-    [0.56, -0.62],
-    [0.56, -0.14],
-  ] as P2[])
-    boltPts.push(v(sx(by, bz) + 0.024, by, bz));
-  scatterBolts(a, boltPts, 0.03, outX, L.steel);
-  scatterBolts(
-    a,
-    boltPts.map((p) => v(-p.x, p.y, p.z)),
-    0.03,
-    v(-1, 0, 0),
-    L.steel,
-  );
-  // driver-side window armour with a vision slit (left only: deliberate asymmetry)
-  const aZ = (y: number): number => 0.5 - (y - 1.0) * 1.26;
-  a.add('kit', plate([v(gx(1.06), 1.06, aZ(1.06)), v(gx(1.2), 1.2, aZ(1.2)), v(gx(1.2), 1.2, -0.3), v(gx(1.06), 1.06, -0.3)], 0.018, outX), L.rustDark);
-  a.add('kit', plate([v(gx(1.26), 1.26, aZ(1.26)), v(gx(1.42), 1.42, aZ(1.42)), v(gx(1.42), 1.42, -0.3), v(gx(1.26), 1.26, -0.3)], 0.018, outX), L.steelDark);
-  // mirrors, sill rails
-  a.addM('kit', box(0.05, 0.1, 0.14), L.blackMetal, { p: [0.93, 1.1, 0.52] });
-  a.addM('kit', rod(v(0.84, 1.05, 0.56), v(0.92, 1.09, 0.53), 0.014, 4), L.steelDark);
-  a.addM('paint', box(0.06, 0.07, 1.74), paint(C.gunmetalDark), { p: [0.9, 0.33, 0.02] });
+  // --- louvred rear window (one slat rattles loose at high damage)
+  for (let i = 0; i < 6; i++) {
+    const t = (i + 0.5) / 6;
+    const y = lerp(roofY - 0.01, heroTopY(HERO_GLASS_END), t) + 0.04;
+    const z = lerp(HERO_ROOF_END - 0.03, HERO_GLASS_END + 0.03, t);
+    const halfW = 0.83 - 0.166 * (1 - t) - 0.1;
+    const slat = box(halfW * 2, 0.014, 0.2);
+    if (i === 2) {
+      const la = new Asm(33, 'hero.louver');
+      la.add('kit', slat, L.blackMetal, { p: [0, y, z], r: [-0.1, 0, 0] });
+      extras.push({ name: 'louverLoose', geo: la.build('kit') as THREE.BufferGeometry, parent: 'body', hideAt: 0.9 });
+    } else a.add('kit', slat, L.blackMetal, { p: [0, y, z], r: [-0.1, 0, i === 4 ? 0.012 : 0] });
+  }
+  a.addM('kit', beam(v(0.6, roofY, -0.76), v(0.74, 1.135, -1.78), 0.035, 0.05), L.steelDark);
+  a.add('kit', beam(v(0, roofY + 0.005, -0.76), v(0, 1.14, -1.78), 0.03, 0.04), L.steelDark);
 
-  // --- tail: light bar, bumper tube, plate
-  a.add('kit', box(1.56, 0.17, 0.04), L.matte, { p: [0, 0.93, -2.3] });
-  a.add('tail', box(1.44, 0.055, 0.03), L.lens, { p: [0, 0.95, -2.318] });
-  for (let i = -3; i <= 3; i++) a.add('kit', box(0.02, 0.07, 0.036), L.matte, { p: [i * 0.2, 0.95, -2.318] });
+  // --- tail: light bar, bumper tube, quad heat-blued exhaust tips, diffuser, plate
+  const tailZ = (x: number): number => -2.305 + 0.06 * (x / HERO_W) ** 2;
+  for (const [tx, tw, ry] of [
+    [0, 0.8, 0],
+    [0.58, 0.42, -0.13],
+    [-0.58, 0.42, 0.13],
+  ] as T3[]) {
+    a.add('kit', box(tw, 0.17, 0.04), L.matte, { p: [tx, 0.95, tailZ(tx) - 0.004], r: [0, ry, 0] });
+    a.add('tail', box(tw - 0.05, 0.055, 0.03), L.lens, { p: [tx, 0.965, tailZ(tx) - 0.02], r: [0, ry, 0] });
+  }
+  for (let i = -3; i <= 3; i++) a.add('kit', box(0.02, 0.075, 0.036), L.matte, { p: [i * 0.2, 0.965, tailZ(i * 0.2) - 0.022] });
   a.add('kit', tube([v(-0.92, 0.5, -2.02), v(-0.8, 0.5, -2.4), v(0.8, 0.5, -2.4), v(0.92, 0.5, -2.02)], 0.04, 6, 3), barLook);
   a.addM('kit', beam(v(0.5, 0.5, -2.2), v(0.5, 0.5, -2.4), 0.05, 0.09), L.steelDark);
-  a.add('kit', box(0.34, 0.12, 0.012), L.bone, { p: [0, 0.7, -2.3], r: [0.12, 0, 0] });
-  a.addM('accent', box(0.03, 0.04, 0.09), paint(0xffffff, 0), { p: [0.9, 0.84, -2.1] });
-  a.addM('accent', box(0.03, 0.04, 0.09), paint(0xffffff, 0), { p: [0.875, 0.8, 2.02] });
+  a.addM('kit', weld(v(0.5, 0.5, -2.4), 0.05), L.weld);
+  a.add('kit', box(0.34, 0.12, 0.012), L.bone, { p: [0, 0.74, -2.325], r: [0.1, 0, 0] });
+  a.addM('accent', box(0.03, 0.04, 0.09), paint(0xffffff, 0), { p: [0.925, 0.86, -2.1] });
+  a.addM('accent', box(0.03, 0.04, 0.09), paint(0xffffff, 0), { p: [0.9, 0.82, 2.02] });
+  // quad tips: straw -> purple -> blue heat bands toward the outlet
+  const blued = (len: number): THREE.BufferGeometry => {
+    const g = cylZ(0.05, 0.046, len, 10, true);
+    const cols = [new THREE.Color(0x6b6e73), new THREE.Color(0x9a7a3a), new THREE.Color(0x6a3f7a), new THREE.Color(0x2f4f9a), new THREE.Color(0x3b4046)];
+    return tint(g, (p) => {
+      const t = clamp01(0.5 - p.z / len) * (cols.length - 1);
+      const i = Math.min(cols.length - 2, Math.floor(t));
+      return cols[i].clone().lerp(cols[i + 1], t - i);
+    });
+  };
+  for (const ex of [0.4, 0.53]) {
+    a.addM('kit', blued(0.34), look(0x6b6e73, 0.28, 1, 0), { p: [ex, 0.37, -2.26] });
+    a.addM('kit', cylZ(0.044, 0.044, 0.01, 8), L.matte, { p: [ex, 0.37, -2.36] });
+    a.addM('kit', cylZ(0.056, 0.056, 0.03, 10, true), L.chrome, { p: [ex, 0.37, -2.42] });
+  }
+  a.addM('kit', box(0.3, 0.02, 0.05), L.steelDark, { p: [0.465, 0.43, -2.2] });
+  // diffuser: raked plate with fins between the pipes
+  a.add('kit', plate([v(-0.32, 0.28, -1.95), v(0.32, 0.28, -1.95), v(0.32, 0.36, -2.34), v(-0.32, 0.36, -2.34)], 0.016, v(0, -1, 0)), L.blackMetal);
+  for (let i = -2; i <= 2; i++) a.add('kit', plate([v(i * 0.13, 0.27, -1.98), v(i * 0.13, 0.36, -2.36), v(i * 0.13, 0.22, -2.36), v(i * 0.13, 0.22, -2.02)], 0.012, outX), L.steelDark);
 
-  // --- deck cargo: leaning spare, two strapped jerry cans, rack rail, whip antenna
+  // --- deck cargo: strapped spare, jerry cans, rack rail, whip antenna with pennant
   const spare = new THREE.TorusGeometry(0.27, 0.115, 7, 14);
-  const spareXf: Xf = { p: [0.4, 1.3, -1.9], r: [-Math.PI / 2 + 0.1, 0, 0.05] };
+  const spareXf: Xf = { p: [0.36, 1.31, -1.92], r: [-Math.PI / 2 + 0.16, 0, 0.05] };
   a.add('kit', spare, L.rubber, spareXf);
   a.add('kit', cylZ(0.17, 0.17, 0.12, 10), L.steelDark, spareXf);
-  a.add('kit', box(0.06, 0.03, 0.8), L.cloth, { p: [0.4, 1.425, -1.9], r: [0.1, 0, 0.05] });
-  a.add('kit', box(0.8, 0.03, 0.06), L.cloth, { p: [0.4, 1.425, -1.9], r: [0.1, 0, 0.05] });
+  a.add('kit', box(0.06, 0.03, 0.8), L.cloth, { p: [0.36, 1.435, -1.92], r: [0.16, 0, 0.05] });
+  a.add('kit', box(0.8, 0.03, 0.06), L.cloth, { p: [0.36, 1.435, -1.92], r: [0.16, 0, 0.05] });
   for (const [cz, lk] of [
     [-1.93, L.canRed],
     [-2.11, L.olive],
   ] as [number, Look][]) {
-    a.add('kit', box(0.4, 0.3, 0.14), lk, { p: [-0.42, 1.3, cz] });
-    a.add('kit', box(0.3, 0.2, 0.15), look(lk.c, lk.r, lk.m, 0.2), { p: [-0.42, 1.3, cz] });
-    a.add('kit', cylY(0.025, 0.025, 0.05, 6), L.steelDark, { p: [-0.55, 1.47, cz] });
-    a.add('kit', box(0.16, 0.025, 0.03), L.steelDark, { p: [-0.4, 1.47, cz] });
+    a.add('kit', box(0.4, 0.3, 0.14), lk, { p: [-0.42, 1.31, cz] });
+    a.add('kit', box(0.3, 0.2, 0.15), look(lk.c, lk.r, lk.m, 0.2), { p: [-0.42, 1.31, cz] });
+    a.add('kit', cylY(0.025, 0.025, 0.05, 6), L.steelDark, { p: [-0.55, 1.48, cz] });
+    a.add('kit', box(0.16, 0.025, 0.03), L.steelDark, { p: [-0.4, 1.48, cz] });
   }
-  a.add('kit', box(0.03, 0.34, 0.36), L.cloth, { p: [-0.42, 1.3, -2.02] });
-  a.add('kit', tube([v(-0.68, 1.14, -1.82), v(-0.68, 1.3, -1.84), v(-0.68, 1.3, -2.2), v(-0.68, 1.15, -2.24)], 0.016, 4, 2, 0.2), L.steelDark);
-  a.add('kit', tube([v(-0.16, 1.14, -1.82), v(-0.16, 1.3, -1.84), v(-0.16, 1.3, -2.2), v(-0.16, 1.15, -2.24)], 0.016, 4, 2, 0.2), L.steelDark);
-  a.add('kit', cylY(0.022, 0.028, 0.1, 6), L.steelDark, { p: [-0.78, 1.15, -1.5] });
-  a.add('kit', rod(v(-0.78, 1.18, -1.5), v(-0.83, 2.55, -1.98), 0.009, 4, 0.004), L.steelDark);
-  a.add('kit', plate([v(-0.83, 2.5, -1.97), v(-0.83, 2.38, -1.93), v(-0.83, 2.42, -2.2)], 0.006, v(-1, 0, 0)), look(C.orange, 0.9, 0, 0));
+  a.add('kit', box(0.03, 0.34, 0.36), L.cloth, { p: [-0.42, 1.31, -2.02] });
+  a.add('kit', tube([v(-0.68, 1.14, -1.82), v(-0.68, 1.31, -1.84), v(-0.68, 1.31, -2.2), v(-0.68, 1.15, -2.24)], 0.016, 4, 2, 0.2), L.steelDark);
+  a.add('kit', tube([v(-0.16, 1.14, -1.82), v(-0.16, 1.31, -1.84), v(-0.16, 1.31, -2.2), v(-0.16, 1.15, -2.24)], 0.016, 4, 2, 0.2), L.steelDark);
+  a.add('kit', cylY(0.022, 0.028, 0.1, 6), L.steelDark, { p: [-0.8, 1.14, -1.62] });
+  a.add('kit', rod(v(-0.8, 1.17, -1.62), v(-0.85, 2.55, -2.05), 0.009, 4, 0.004), L.steelDark);
+  a.add('kit', rag(0.34, 0.14, 0.05, 5), look(C.orange, 0.9, 0, 0.05), { p: [-0.85, 2.52, -2.05], r: [0, Math.PI / 2 + 0.2, 0] });
 
-  // roof marker lights (amber accent)
-  for (const mx of [-0.36, -0.18, 0.18, 0.36]) a.add('accent', box(0.07, 0.03, 0.05), paint(0xffffff, 0), { p: [mx, 1.505, 0.02] });
-  a.add('kit', box(0.92, 0.02, 0.07), L.blackMetal, { p: [0, 1.49, 0.02] });
+  // --- roof: light bar (lamps share the headlight material but sit dark), amber markers
+  a.add('kit', box(0.96, 0.075, 0.11), L.blackMetal, { p: [0, roofY + 0.05, 0.0] });
+  a.addM('kit', box(0.03, 0.06, 0.08), L.steelDark, { p: [0.4, roofY + 0.01, 0.0] });
+  for (const lx of [-0.3, -0.1, 0.1, 0.3]) {
+    a.add('kit', cylZ(0.042, 0.042, 0.03, 8, true), L.steel, { p: [lx, roofY + 0.05, 0.06] });
+    a.add('head', cylZ(0.034, 0.038, 0.02, 8), L.lensOff, { p: [lx, roofY + 0.05, 0.062] });
+  }
+  for (const mx of [-0.44, 0.44]) a.add('accent', box(0.06, 0.05, 0.06), paint(0xffffff, 0), { p: [mx, roofY + 0.05, 0.03] });
 
-  const bodyGeo = finishBody(a, 0.55, 0.3);
+  const kit = a.build('kit');
+  dustGradient(kit, 0.6, 0.34);
 
   // --- roof autocannon turret (own mesh, yaws)
-  const t = new Asm(23);
+  const t = new Asm(23, 'hero.turret');
   t.add('t', cylY(0.25, 0.27, 0.05, 14), L.steelDark, { p: [0, 0.025, 0] });
   t.add('t', cylY(0.17, 0.2, 0.05, 10), L.steel, { p: [0, 0.07, 0] });
   let housing = profileX(
@@ -1215,27 +2661,51 @@ function buildHero(): Blueprint {
   }
   t.add('t', box(0.24, 0.035, 0.06), L.steelDark, { p: [0, 0.17, 0.7] });
   // gun shield: two raked plates either side of the barrels
-  t.addM('t', plate([v(0.14, 0.07, 0.3), v(0.36, 0.07, 0.16), v(0.34, 0.34, 0.1), v(0.14, 0.33, 0.24)], 0.02, v(0.3, 0, 1)), look(0x33373c, 0.55, 0.75, 0.06));
+  const shield = [v(0.14, 0.07, 0.3), v(0.36, 0.07, 0.16), v(0.34, 0.34, 0.1), v(0.14, 0.33, 0.24)];
+  t.addM('t', plate(shield, 0.02, v(0.3, 0, 1)), look(0x33373c, 0.55, 0.75, 0.06));
+  t.addM('t', rivets(outlinePts(shield, 0.1, 0.03).map((p) => p.add(v(0.008, 0, 0.02))), 0.02, v(0.5, 0, 1)), L.steel);
   t.add('t', plate([v(-0.14, 0.24, 0.27), v(0.14, 0.24, 0.27), v(0.14, 0.34, 0.24), v(-0.14, 0.34, 0.24)], 0.02, AXIS_Z), L.steelDark);
-  // ammo drum (left) and optic (right)
+  // ammo drum (left), feed belt and optic (right)
   t.add('t', cylX(0.13, 0.13, 0.11, 12), L.steelDark, { p: [0.21, 0.17, -0.08] });
   t.add('t', cylX(0.06, 0.06, 0.13, 8), L.rust, { p: [0.215, 0.17, -0.08] });
   t.add('t', box(0.09, 0.05, 0.2), L.steel, { p: [0.19, 0.2, 0.08], r: [0, 0.3, 0] });
+  for (let i = 0; i < 5; i++) t.add('t', cylX(0.012, 0.012, 0.07, 5), look(0xa07a2c, 0.35, 0.9, 0.08), { p: [0.2 - i * 0.012, 0.236, 0.02 + i * 0.03] });
   t.add('t', box(0.08, 0.08, 0.2), L.blackMetal, { p: [-0.2, 0.22, 0.02] });
   t.add('t', cylZ(0.034, 0.034, 0.02, 8), look(0x1a2a3a, 0.1, 0.6, 0), { p: [-0.2, 0.22, 0.13] });
   t.add('t', rod(v(-0.12, 0.265, -0.22), v(-0.14, 0.62, -0.3), 0.007, 4, 0.004), L.steelDark);
   t.add('t', box(0.2, 0.1, 0.1), L.rustDark, { p: [0, 0.16, -0.33] });
+  t.add('t', decal([v(-0.1, 0.268, -0.1), v(0.1, 0.268, -0.1), v(0.1, 0.268, -0.02), v(-0.1, 0.268, -0.02)], AXIS_Y), look(C.orange, 0.6, 0.2, 0));
   const turretGeo = t.build('t') as THREE.BufferGeometry;
 
-  const spec = (w: number): WheelSpec => ({ r: WR, w, seg: 18, lugs: 12, rim: look(0x64676b, 0.4, 0.9, 0), spokes: 5, nuts: 5, hubSpike: 0, dual: false });
+  const spec = (w: number): WheelSpec => ({ r: WR, w, seg: 24, lugs: 14, rim: look(0x6c6f74, 0.36, 0.92, 0), style: 'alloy', hubSpike: 0, dual: false, mud: 0.25 });
   const front = wheelGeometry('heroFront', spec(0.28));
   const rear = wheelGeometry('heroRear', spec(0.33));
 
+  // static brake callipers (do not spin with the wheel): fronts follow the steering pivots
+  const calliper = (s: number, w: number): THREE.BufferGeometry => {
+    const c = new Asm(34, 'hero.calliper');
+    const rimR = WR * 0.64;
+    const cx = s * (-w * 0.5 * 0.12);
+    c.add('kit', box(0.075, 0.1, 0.2), look(0xb02a18, 0.45, 0.4, 0), { p: [cx, rimR * 0.66 * Math.sin(0.5), -rimR * 0.66 * Math.cos(0.5)], r: [0.5 - Math.PI / 2, 0, 0] });
+    c.add('kit', box(0.085, 0.03, 0.12), L.steelDark, { p: [cx, rimR * 0.66 * Math.sin(0.5), -rimR * 0.66 * Math.cos(0.5)], r: [0.5 - Math.PI / 2, 0, 0] });
+    return c.build('kit') as THREE.BufferGeometry;
+  };
+  extras.push({ name: 'calliperFL', geo: calliper(1, 0.28), parent: 0 }, { name: 'calliperFR', geo: calliper(-1, 0.28), parent: 1 });
+  const rearPair = mergeGeometries([calliper(1, 0.33).translate(0.86, WR, RZ), calliper(-1, 0.33).translate(-0.86, WR, RZ)], false) as THREE.BufferGeometry;
+  extras.push({ name: 'callipersRear', geo: sanitize(rearPair, 'hero.callipersRear'), parent: 'root' });
+
   return {
-    ...bodyGeo,
+    paint: paintGeo,
+    kit,
+    glass: glassGeo,
+    head: a.build('head'),
+    tail: a.build('tail'),
+    accent: a.build('accent'),
+    hull,
+    extras,
     turret: {
       geo: turretGeo,
-      p: [0, 1.495, -0.34],
+      p: [0, roofY + 0.01, -0.34],
       muzzles: [
         { p: [0.075, 0.17, 1.09], d: [0, 0, 1] },
         { p: [-0.075, 0.17, 1.09], d: [0, 0, 1] },
@@ -1243,8 +2713,8 @@ function buildHero(): Blueprint {
     },
     bodyMuzzles: [],
     exhausts: [
-      { p: [1.1, 0.452, -0.885], d: [0.28, 0.32, -0.9] },
-      { p: [-1.1, 0.452, -0.885], d: [-0.28, 0.32, -0.9] },
+      { p: [0.465, 0.37, -2.45], d: [0.04, 0.06, -1] },
+      { p: [-0.465, 0.37, -2.45], d: [-0.04, 0.06, -1] },
     ],
     wheels: [
       { name: 'wheelFL', p: [0.87, WR, FZ], geo: front.left, steer: true },
@@ -1259,22 +2729,30 @@ function buildHero(): Blueprint {
 
 export function createHeroCar(): VehicleModel {
   if (!heroBlueprint) heroBlueprint = buildHero();
-  const grime = grimeTexture();
+  if (!heroTextures) heroTextures = buildHeroTextures(heroBlueprint.hull);
   const paintMat = new THREE.MeshPhysicalMaterial({
     name: 'interceptorPaint',
     color: 0xffffff,
     vertexColors: true,
-    map: grime,
-    roughnessMap: grime,
-    roughness: 0.5,
-    metalness: 0.55,
-    clearcoat: 0.6,
-    clearcoatRoughness: 0.28,
+    map: heroTextures.albedo,
+    roughnessMap: heroTextures.orm,
+    metalnessMap: heroTextures.orm,
+    normalMap: heroTextures.normal,
+    normalScale: new THREE.Vector2(1, 1),
+    roughness: 1,
+    metalness: 1,
+    clearcoat: 0.55,
+    clearcoatRoughness: 0.26,
+    envMapIntensity: 1.15,
+    // the cabin is visible through the glass, so the shell needs its inner faces
+    side: THREE.DoubleSide,
   });
+  const damage = addDamageShader(paintMat, false);
   return instantiate(heroBlueprint, {
     name: 'interceptor',
     paint: paintMat,
-    scorchRoughness: 0.95,
+    damage,
+    scorchRoughness: 1,
     headColor: 0xfff2d6,
     headEmissive: 0xffd9a0,
     accentColor: 0xffa53a,
@@ -1283,770 +2761,13 @@ export function createHeroCar(): VehicleModel {
   });
 }
 
-// ---------------------------------------------------------------- RAIDER BUGGY
-
-const buggyBlueprints = new Map<number, Blueprint>();
-
-function buildBuggy(variant: number): Blueprint {
-  const a = new Asm(100 + variant);
-  const ext = variant === 2 ? 0.5 : 0;
-  /** Point helper: everything ahead of the cockpit slides forward on the long variant. */
-  const F = (x: number, y: number, z: number): V3 => v(x, y, z > 0.6 ? z + ext : z);
-  const FR = 0.4;
-  const RR = 0.5;
-  const fAxle = 1.15 + ext;
-  const rAxle = -1.05;
-  const TR = 0.034;
-  const up = AXIS_Y;
-  const outX = v(1, 0, 0);
-
-  const panelA = variant === 1 ? C.raiderRed : C.bone;
-  const panelB = variant === 1 ? C.bone : C.raiderRed;
-  const frameLook = variant === 2 ? look(0x241d1a, 0.65, 0.65, 0.1) : L.frame;
-
-  // --- tube frame
-  a.addM('kit', tube([F(0.3, 0.38, 1.55), F(0.55, 0.36, 0.8), v(0.62, 0.36, -0.45), v(0.48, 0.48, -1.5)], TR, 5, 3), frameLook);
-  a.addM('kit', tube([F(0.28, 0.64, 1.5), F(0.58, 0.8, 0.62), v(0.63, 0.84, -0.45), v(0.46, 0.95, -1.5)], TR, 5, 3), frameLook);
-  a.add(
-    'kit',
-    tube([v(0.62, 0.36, -0.45), v(0.64, 0.95, -0.45), v(0.5, 1.42, -0.4), v(-0.5, 1.42, -0.4), v(-0.64, 0.95, -0.45), v(-0.62, 0.36, -0.45)], 0.04, 6, 3, 0.22),
-    frameLook,
-  );
-  a.add('kit', tube([F(0.58, 0.8, 0.62), v(0.47, 1.37, 0.22), v(-0.47, 1.37, 0.22), F(-0.58, 0.8, 0.62)], TR, 5, 3, 0.22), frameLook);
-  a.addM('kit', rod(v(0.47, 1.37, 0.22), v(0.5, 1.42, -0.4), TR, 5), frameLook);
-  a.add('kit', rod(v(0, 1.38, 0.22), v(0, 1.43, -0.4), TR * 0.9, 5), frameLook);
-  a.addM('kit', rod(v(0.5, 1.42, -0.4), v(0.44, 0.95, -1.52), TR, 5), frameLook);
-  a.add('kit', rod(v(-0.48, 0.95, -1.5), v(0.48, 0.95, -1.5), TR, 5), frameLook);
-  a.add('kit', rod(v(-0.5, 0.48, -1.5), v(0.5, 0.48, -1.5), TR, 5), frameLook);
-  a.addM('kit', rod(v(0.48, 0.48, -1.5), v(0.46, 0.95, -1.5), TR, 5), frameLook);
-  a.addM('kit', rod(v(0.62, 0.37, 0.45), v(0.63, 0.84, -0.42), TR * 0.85, 5), frameLook);
-  a.addM('kit', rod(F(0.3, 0.38, 1.55), F(0.28, 0.64, 1.5), TR, 5), frameLook);
-  a.add('kit', rod(F(-0.3, 0.38, 1.56), F(0.3, 0.38, 1.56), TR, 5), frameLook);
-  a.add('kit', rod(F(-0.28, 0.64, 1.51), F(0.28, 0.64, 1.51), TR, 5), frameLook);
-  a.add('kit', rod(F(-0.42, 0.37, 1.66), F(0.42, 0.37, 1.66), 0.045, 6, 0.045, false), L.steelDark);
-  a.addM('kit', rod(F(0.3, 0.38, 1.55), F(0.36, 0.37, 1.66), TR, 5), frameLook);
-  // floor pan
-  a.add('kit', box(1.16, 0.03, 2.0 + ext), L.matte, { p: [0, 0.35, 0.45 + ext / 2] });
-
-  // --- suspension
-  a.addM('kit', rod(F(0.3, 0.4, 1.4), v(0.72, 0.4, fAxle), 0.024, 5), L.steelDark);
-  a.addM('kit', rod(F(0.3, 0.4, 0.92), v(0.72, 0.4, fAxle), 0.024, 5), L.steelDark);
-  a.addM('kit', rod(F(0.29, 0.62, 1.22), v(0.72, 0.5, fAxle), 0.022, 5), L.steelDark);
-  a.addM('kit', rod(F(0.3, 0.66, 1.12), v(0.62, 0.42, fAxle - 0.03), 0.048, 6, 0.048, false), look(C.raiderRedDark, 0.5, 0.6, 0));
-  a.add('kit', rod(v(-0.64, RR, rAxle), v(0.64, RR, rAxle), 0.06, 6), L.steelDark);
-  a.add('kit', cylY(0.15, 0.15, 0.2, 8).rotateX(Math.PI / 2), L.rustDark, { p: [0, RR, rAxle] });
-  a.addM('kit', rod(v(0.6, 0.38, -0.3), v(0.56, RR, rAxle), 0.04, 5), L.steelDark);
-  a.addM('kit', rod(v(0.47, 0.95, -1.25), v(0.54, 0.52, rAxle - 0.04), 0.05, 6, 0.05, false), look(C.raiderRedDark, 0.5, 0.6, 0));
-
-  // --- body panels (hazard paint, scorches with damage)
-  const hoodFront = 1.5;
-  a.add('paint', plate([F(0.27, 0.66, hoodFront), F(-0.27, 0.66, hoodFront), F(-0.57, 0.83, 0.62), F(0.57, 0.83, 0.62)], 0.016, up), paint(panelA));
-  if (variant === 2) {
-    a.addM('paint', plate([F(0.2, 0.678, hoodFront - 0.02), F(0.12, 0.678, hoodFront - 0.02), F(0.26, 0.845, 0.66), F(0.42, 0.845, 0.66)], 0.008, up), paint(panelB, 0));
-  } else {
-    a.add('paint', plate([F(0.1, 0.678, hoodFront - 0.02), F(-0.1, 0.678, hoodFront - 0.02), F(-0.16, 0.845, 0.66), F(0.16, 0.845, 0.66)], 0.008, up), paint(panelB, 0));
-  }
-  a.addM('paint', plate([F(0.315, 0.39, 1.53), F(0.295, 0.63, 1.5), F(0.595, 0.81, 0.63), F(0.57, 0.37, 0.8)], 0.016, outX), paint(panelB));
-  a.addM('paint', plate([F(0.585, 0.37, 0.75), F(0.605, 0.8, 0.61), v(0.655, 0.84, -0.43), v(0.645, 0.37, -0.43)], 0.016, outX), paint(panelA));
-  // hazard chevrons on the door
-  const chev = variant === 2 ? 2 : 3;
-  for (let i = 0; i < chev; i++) {
-    const z0 = 0.36 - i * (variant === 2 ? 0.36 : 0.26);
-    const wz = variant === 2 ? 0.2 : 0.12;
-    a.addM('paint', plate([v(0.664, 0.42, z0), v(0.664, 0.42, z0 - wz), v(0.672, 0.76, z0 - wz - 0.18), v(0.672, 0.76, z0 - 0.18)], 0.008, outX), paint(panelB, 0));
-  }
-  // rear gusset fins between hoop and tail brace
-  a.addM('paint', plate([v(0.57, 0.98, -0.5), v(0.52, 1.4, -0.42), v(0.46, 0.97, -1.48)], 0.016, outX), paint(panelB));
-  // roof sheet
-  a.add('paint', plate([v(0.47, 1.4, 0.24), v(-0.47, 1.4, 0.24), v(-0.52, 1.455, -0.44), v(0.52, 1.455, -0.44)], 0.02, up), paint(variant === 1 ? C.rustDark : C.rust, 0.1));
-  if (variant === 1) {
-    a.add('paint', plate([v(0.5, 1.42, 0.3), v(-0.5, 1.42, 0.3), v(-0.42, 1.3, 0.62), v(0.42, 1.3, 0.62)], 0.02, up), paint(C.rustDark, 0.1));
-  }
-
-  // --- driver, seat, wheel
-  a.add('kit', box(0.5, 0.1, 0.5), L.cloth, { p: [0, 0.46, -0.02] });
-  a.add('kit', box(0.5, 0.66, 0.1), L.cloth, { p: [0, 0.8, -0.32], r: [-0.14, 0, 0] });
-  a.add('kit', box(0.42, 0.5, 0.25), look(0x2a2420, 0.9, 0, 0), { p: [0, 0.8, -0.16], r: [-0.12, 0, 0] });
-  a.add('kit', new THREE.SphereGeometry(0.135, 8, 6), L.bone, { p: [0, 1.2, -0.16] });
-  a.add('kit', box(0.21, 0.07, 0.08), L.matte, { p: [0, 1.21, -0.06] });
-  a.add('kit', box(0.16, 0.1, 0.1), look(C.raiderRedDark, 0.8, 0, 0), { p: [0, 1.11, -0.07] });
-  a.addM('kit', rod(v(0.22, 0.98, -0.12), v(0.13, 0.9, 0.3), 0.05, 5), look(0x2a2420, 0.9, 0, 0));
-  a.add('kit', rod(v(0, 0.62, 0.62), v(0, 0.9, 0.34), 0.02, 5), L.steelDark);
-  a.add('kit', rod(v(0, 0.9, 0.34), v(0, 0.915, 0.325), 0.16, 8, 0.16, false), L.matte);
-  a.add('kit', box(0.92, 0.14, 0.06), L.blackMetal, { p: [0, 0.84, 0.58] });
-
-  // --- exposed rear engine
-  const EZ = -1.02;
-  a.add('kit', box(0.46, 0.34, 0.62), L.steelDark, { p: [0, 0.72, EZ] });
-  a.add('kit', box(0.34, 0.26, 0.3), L.rustDark, { p: [0, 0.58, EZ - 0.42] });
-  for (const s of [1, -1]) {
-    a.add('kit', box(0.2, 0.15, 0.58), L.alloy, { p: [s * 0.2, 0.93, EZ], r: [0, 0, -s * 0.7] });
-    a.add('kit', box(0.21, 0.04, 0.5), look(C.raiderRed, 0.55, 0.5, 0), { p: [s * 0.265, 0.985, EZ], r: [0, 0, -s * 0.7] });
-  }
-  a.add('kit', cylY(0.17, 0.17, 0.09, 10), L.chrome, { p: [0, 1.13, EZ] });
-  a.add('kit', cylY(0.11, 0.14, 0.08, 8), L.steelDark, { p: [0, 1.06, EZ] });
-  a.add('kit', cylZ(0.14, 0.14, 0.04, 10), L.steel, { p: [0, 0.76, EZ - 0.34] });
-  a.add('kit', cylX(0.17, 0.17, 0.78, 10), look(variant === 1 ? C.boneDirty : C.raiderRed, 0.6, 0.4, 0), { p: [0, 0.64, -0.6] });
-  a.add('kit', box(0.06, 0.36, 0.36), L.bone, { p: [0.12, 0.64, -0.6] });
-  for (let i = 0; i < 3; i++) {
-    a.addM('kit', rod(v(0.3, 0.92, EZ + 0.2 - i * 0.2), v(0.4, 0.84, EZ + 0.1 - i * 0.2), 0.026, 5), L.rust);
-  }
-  const exhausts: Socket[] = [];
-  if (variant === 2) {
-    a.addM('kit', tube([v(0.4, 0.84, EZ + 0.1), v(0.44, 0.82, -1.4), v(0.44, 1.2, -1.56), v(0.45, 2.02, -1.62)], 0.05, 6, 3, 0.25), L.rust);
-    a.addM('kit', rod(v(0.45, 1.3, -1.575), v(0.45, 1.75, -1.6), 0.07, 7, 0.07, false), L.steelDark);
-    exhausts.push({ p: [0.45, 2.04, -1.62], d: [0, 1, -0.1] }, { p: [-0.45, 2.04, -1.62], d: [0, 1, -0.1] });
-  } else {
-    a.addM('kit', tube([v(0.4, 0.84, EZ + 0.1), v(0.5, 0.84, -1.5), v(0.53, 1.02, -1.72), v(0.55, 1.3, -1.86)], 0.048, 6, 3, 0.3), L.rust);
-    a.addM('kit', rod(v(0.545, 1.24, -1.83), v(0.56, 1.42, -1.92), 0.055, 7, 0.085), L.steelDark);
-    exhausts.push({ p: [0.56, 1.44, -1.93], d: [0.08, 0.9, -0.45] }, { p: [-0.56, 1.44, -1.93], d: [-0.08, 0.9, -0.45] });
-  }
-  a.addM('tail', box(0.12, 0.07, 0.04), L.lens, { p: [0.32, 0.98, -1.535] });
-
-  // --- skull plate with glowing sockets (attack telegraph)
-  a.push({ p: [0, variant === 1 ? 0.86 : 0.76, 1.6 + ext], r: [-0.2, 0, 0], s: variant === 2 ? 0.86 : 0.78 });
-  addSkull(a, paint(variant === 1 ? C.boneDirty : C.bone, 0));
-  a.pop();
-  a.addM('kit', rod(F(0.26, 0.64, 1.51), F(0.2, 0.86, 1.6), 0.02, 4), frameLook);
-
-  // lamps on stalks beside the skull
-  a.addM('kit', rod(F(0.3, 0.6, 1.5), F(0.5, 0.7, 1.52), 0.018, 4), frameLook);
-  a.addM('kit', cylZ(0.085, 0.07, 0.1, 8), L.blackMetal, { p: [0.5, 0.72, 1.55 + ext] });
-  a.addM('head', cylZ(0.055, 0.072, 0.024, 8), L.lens, { p: [0.5, 0.72, 1.61 + ext] });
-
-  // red light bar on the front hoop (accent)
-  a.add('kit', box(0.82, 0.08, 0.07), L.blackMetal, { p: [0, 1.41, 0.25] });
-  for (const lx of [-0.3, -0.1, 0.1, 0.3]) a.add('accent', box(0.13, 0.055, 0.03), paint(0xffffff, 0), { p: [lx, 1.41, 0.29] });
-
-  // --- front weapons: spikes or dozer blade
-  let frontZ = 1.72 + ext;
-  if (variant === 1) {
-    const R = 0.5;
-    const outer: P2[] = [];
-    const inner: P2[] = [];
-    for (let i = 0; i <= 6; i++) {
-      const ang = lerp(-0.95, 0.85, i / 6);
-      outer.push([1.86 + R * (1 - Math.cos(ang)), 0.5 + R * Math.sin(ang)]);
-      inner.push([1.82 + R * (1 - Math.cos(ang)), 0.5 + R * Math.sin(ang)]);
-    }
-    const blade = profileX([...outer, ...inner.reverse()], 1.84, 0, 8);
-    colorTris(blade, (cen, nor) => {
-      if (nor.z < 0.2) return C.rustDark;
-      const band = Math.floor((cen.x + 0.92 + cen.y * 0.35) / 0.23);
-      return band % 2 === 0 ? C.bone : C.raiderRed;
-    });
-    a.add('paint', blade, paint(C.bone));
-    a.addM('kit', rod(F(0.32, 0.4, 1.5), v(0.6, 0.3, 1.84), 0.035, 5), L.steelDark);
-    a.addM('kit', rod(F(0.28, 0.64, 1.48), v(0.6, 0.72, 1.86), 0.03, 5), L.steelDark);
-    for (let i = -3; i <= 3; i++) a.add('kit', rod(v(i * 0.27, 0.88, 2.0), v(i * 0.27, 1.06, 2.12), 0.04, 4, 0), L.steelDark);
-    for (const sz of [0.32, 0.02, -0.28]) a.addM('kit', rod(v(0.66, 0.6, sz), v(1.0, 0.64, sz), 0.045, 4, 0), L.steelDark);
-    frontZ = 2.14;
-  } else {
-    for (let i = -2; i <= 2; i++) {
-      const bx = i * 0.2;
-      a.add('kit', rod(F(bx, 0.37, 1.67), F(bx * 1.5, 0.42 + Math.abs(i) * 0.02, 2.06 - Math.abs(i) * 0.05), 0.045, 4, 0), L.steelDark);
-    }
-    a.addM('kit', plate([F(0.4, 0.3, 1.64), F(0.62, 0.34, 1.5), F(0.66, 0.52, 1.44), F(0.42, 0.5, 1.66)], 0.014, v(0.3, 0, 1)), L.rustDark);
-    frontZ = 2.08 + ext;
-  }
-
-  // --- variant 2: twin war flags on the hoop
-  if (variant === 2) {
-    for (const s of [1, -1]) {
-      a.add('kit', rod(v(s * 0.5, 1.42, -0.4), v(s * 0.56, 2.62, -0.66), 0.018, 4, 0.012), L.steelDark);
-      a.add('paint', plate([v(s * 0.56, 2.58, -0.66), v(s * 0.55, 2.12, -0.57), v(s * 0.56, 2.3, -1.3)], 0.008, v(s, 0, 0)), paint(s > 0 ? C.raiderRed : C.bone, 0));
-      a.add('paint', plate([v(s * 0.55, 2.1, -0.57), v(s * 0.54, 1.92, -0.53), v(s * 0.55, 2.0, -0.95)], 0.008, v(s, 0, 0)), paint(C.raiderRedDark, 0));
-    }
-  }
-
-  // --- pintle gun on the roll hoop (fixed)
-  const GY = 1.66;
-  const GZ = -0.3;
-  a.add('kit', rod(v(0, 1.43, -0.4), v(0, GY - 0.06, -0.36), 0.03, 5), L.steelDark);
-  a.add('kit', box(0.11, 0.13, 0.42), L.blackMetal, { p: [0, GY, GZ] });
-  a.add('kit', rod(v(0, GY + 0.01, GZ + 0.2), v(0, GY + 0.01, GZ + 0.98), 0.024, 6, 0.022, false), L.blackMetal);
-  a.add('kit', rod(v(0, GY + 0.01, GZ + 0.2), v(0, GY + 0.01, GZ + 0.6), 0.042, 6, 0.042, false), L.steel);
-  a.add('kit', rod(v(0, GY + 0.01, GZ + 0.94), v(0, GY + 0.01, GZ + 1.02), 0.036, 6, 0.036, false), L.steelDark);
-  a.add('kit', box(0.12, 0.16, 0.2), L.olive, { p: [0.13, GY - 0.02, GZ + 0.02] });
-  a.addM('kit', rod(v(0.04, GY, GZ - 0.2), v(0.07, GY - 0.02, GZ - 0.34), 0.014, 4), L.steelDark);
-  a.addM('kit', plate([v(0.05, GY - 0.14, GZ + 0.26), v(0.24, GY - 0.12, GZ + 0.2), v(0.22, GY + 0.16, GZ + 0.16), v(0.05, GY + 0.14, GZ + 0.24)], 0.014, AXIS_Z), L.rustDark);
-
-  const bodyGeo = finishBody(a, 0.7, 0.5);
-
-  const rimLook = look(variant === 1 ? 0x5b5148 : C.raiderRedDark, 0.6, 0.6, 0);
-  const front = wheelGeometry(`buggyFront${variant === 1 ? 'B' : 'A'}`, { r: FR, w: 0.26, seg: 14, lugs: 9, rim: rimLook, spokes: 4, nuts: 0, hubSpike: 0.2, dual: false });
-  const rear = wheelGeometry(`buggyRear${variant === 1 ? 'B' : 'A'}`, { r: RR, w: 0.44, seg: 14, lugs: 10, rim: rimLook, spokes: 4, nuts: 0, hubSpike: 0.24, dual: false });
-
-  // keep the origin under the vehicle centre: the long variant grows forward only, so slide it back
-  const rearZ = variant === 2 ? -1.66 : -1.95;
-  const dz = variant === 2 ? -(frontZ + rearZ) / 2 : 0;
-  if (dz !== 0) {
-    for (const g of [bodyGeo.paint, bodyGeo.kit, bodyGeo.glass, bodyGeo.head, bodyGeo.tail, bodyGeo.accent]) {
-      if (!g) continue;
-      g.translate(0, 0, dz);
-      g.computeBoundingBox();
-      g.computeBoundingSphere();
-    }
-  }
-  const sock = (s: Socket): Socket => ({ p: [s.p[0], s.p[1], s.p[2] + dz], d: s.d });
-  const halfLen = Math.max(frontZ + dz, -(rearZ + dz));
-  return {
-    ...bodyGeo,
-    bodyMuzzles: [sock({ p: [0, GY + 0.01, GZ + 1.04], d: [0, 0, 1] })],
-    exhausts: exhausts.map(sock),
-    wheels: [
-      { name: 'wheelFL', p: [0.8, FR, fAxle + dz], geo: front.left, steer: true },
-      { name: 'wheelFR', p: [-0.8, FR, fAxle + dz], geo: front.right, steer: true },
-      { name: 'wheelRL', p: [0.76, RR, rAxle + dz], geo: rear.left, steer: false },
-      { name: 'wheelRR', p: [-0.76, RR, rAxle + dz], geo: rear.right, steer: false },
-    ],
-    halfExtents: { x: variant === 1 ? 1.0 : 0.98, y: 0.78, z: Math.round(halfLen * 100) / 100 },
-    wheelRadius: 0.45,
-  };
+export function createRaiderBuggy(_variant: number): VehicleModel {
+  return createHeroCar();
 }
-
-const variantIndex = (variant: number): number => (Number.isFinite(variant) ? ((Math.floor(variant) % 3) + 3) % 3 : 0);
-
-export function createRaiderBuggy(variant: number): VehicleModel {
-  const vi = variantIndex(variant);
-  let bp = buggyBlueprints.get(vi);
-  if (!bp) {
-    bp = buildBuggy(vi);
-    buggyBlueprints.set(vi, bp);
-  }
-  const grime = grimeTexture();
-  const paintMat = new THREE.MeshStandardMaterial({
-    name: 'raiderPaint',
-    color: 0xffffff,
-    vertexColors: true,
-    map: grime,
-    roughnessMap: grime,
-    roughness: 0.82,
-    metalness: 0.25,
-  });
-  return instantiate(bp, {
-    name: `raiderBuggy${vi}`,
-    paint: paintMat,
-    scorchRoughness: 1,
-    headColor: 0xffe9b8,
-    headEmissive: 0xffc56a,
-    accentColor: 0xff3a1c,
-    accentEmissive: 0xff2408,
-    accentIntensity: 1.4,
-  });
-}
-
-// ---------------------------------------------------------------- WAR RIG (boss)
-
-let rigBlueprint: Blueprint | null = null;
-
-function buildRig(): Blueprint {
-  const a = new Asm(500);
-  const WR = 0.62;
-  const FZ = 3.05;
-  const R1 = -2.0;
-  const R2 = -3.45;
-  const up = AXIS_Y;
-  const outX = v(1, 0, 0);
-
-  // --- ladder chassis
-  a.addM('kit', box(0.16, 0.3, 8.7), L.frame, { p: [0.5, 0.98, -0.2] });
-  for (const cz of [3.7, 1.5, -0.5, -2.72, -4.3]) a.add('kit', box(1.0, 0.2, 0.14), L.frame, { p: [0, 0.98, cz] });
-  a.add('kit', rod(v(-1.2, WR, FZ), v(1.2, WR, FZ), 0.09, 6), L.steelDark);
-  for (const rz of [R1, R2]) {
-    a.add('kit', rod(v(-1.1, WR, rz), v(1.1, WR, rz), 0.11, 6), L.steelDark);
-    a.add('kit', new THREE.SphereGeometry(0.27, 8, 6), L.rustDark, { p: [0, WR, rz] });
-  }
-  a.add('kit', rod(v(0, 0.7, 1.6), v(0, WR, R1), 0.06, 5), L.steelDark);
-  a.add('kit', box(1.7, 0.36, 6.0), L.matte, { p: [0, 1.2, -1.35] });
-  a.add('kit', box(2.3, 0.5, 1.5), L.matte, { p: [0, 1.25, 3.05] });
-  // saddle fuel tanks, straps, steps
-  a.addM('kit', cylZ(0.33, 0.33, 1.5, 12), look(0x3b3d40, 0.45, 0.85, 0), { p: [1.08, 0.82, 0.55] });
-  for (const sz of [0.05, 1.05]) a.addM('kit', cylZ(0.345, 0.345, 0.07, 12, true), L.rustDark, { p: [1.08, 0.82, sz] });
-  a.addM('kit', box(0.34, 0.06, 0.5), L.steelDark, { p: [1.3, 0.62, 1.75] });
-  a.addM('kit', box(0.34, 0.06, 0.5), L.steelDark, { p: [1.3, 0.95, 1.8] });
-
-  // --- cab-over cab: side profile extrusion with wheel arch, bevel, tumblehome
-  const cabProfile: P2[] = [
-    [2.1, 1.05],
-    [2.1, 3.12],
-    [2.28, 3.24],
-    [3.45, 3.24],
-    [3.72, 3.1],
-    [3.93, 2.32],
-    [4.0, 2.2],
-    [4.0, 1.25],
-    [3.9, 1.05],
-    ...archPts(FZ, WR, 0.74, 1.05, 8).reverse(),
-  ];
-  const cabX = (y: number): number => 1.38 * (1 - 0.075 * sm(2.2, 3.24, y));
-  let cab = profileX(cabProfile, 2.76, 0.05, 4, 2);
-  colorTris(cab, (cen, nor) => {
-    if (Math.abs(nor.x) > 0.8 && cen.y < 1.7) return C.rigOxide;
-    if (nor.y > 0.8) return C.rigIronLight;
-    return C.rigIron;
-  });
-  deform(cab, (p) => {
-    p.x *= cabX(p.y) / 1.38;
-  });
-  cab = toCreasedNormals(cab, 0.55);
-  a.add('paint', cab, paint(C.rigIron));
-
-  a.addM('paint', archFlare(0.75, 0.9, 0.3, 0.1), paint(C.rigIronLight), { p: [1.33, WR, FZ] });
-
-  // windshield: dark glass behind armour bands (two slits) and a bar cage
-  const wz = (y: number): number => 3.93 - (y - 2.32) * 0.269;
-  const wn = v(0, 0.26, 1).normalize();
-  const wpt = (x: number, y: number, off: number): V3 => v(x, y, wz(y)).addScaledVector(wn, off);
-  a.add('glass', plate([wpt(1.14, 2.42, 0.004), wpt(1.08, 3.02, 0.004), wpt(-1.08, 3.02, 0.004), wpt(-1.14, 2.42, 0.004)], 0.02, wn), paint(0xffffff, 0));
-  const bands: [number, number, number][] = [
-    [2.34, 2.57, C.rigOxide],
-    [2.68, 2.8, C.rigIronLight],
-    [2.91, 3.09, C.rigIron],
-  ];
-  for (const [y0, y1, c] of bands) {
-    a.add('paint', plate([wpt(1.24, y0, 0.03), wpt(1.2, y1, 0.03), wpt(-1.2, y1, 0.03), wpt(-1.24, y0, 0.03)], 0.04, wn), paint(c, 0.06));
-  }
-  for (let i = -3; i <= 3; i++) {
-    a.add('kit', rod(wpt(i * 0.34, 2.28, 0.1), wpt(i * 0.33, 3.14, 0.1), 0.022, 5), L.steelDark);
-  }
-  a.add('paint', plate([v(1.34, 3.2, 3.5), v(-1.34, 3.2, 3.5), v(-1.3, 3.02, 4.12), v(1.3, 3.02, 4.12)], 0.05, up), paint(C.rigIronLight));
-  // side slit windows + door plates + grab rails
-  a.addM('glass', plate([v(cabX(2.5) + 0.004, 2.5, 2.85), v(cabX(2.5) + 0.004, 2.5, 3.62), v(cabX(2.96) + 0.004, 2.96, 3.52), v(cabX(2.96) + 0.004, 2.96, 2.85)], 0.012, outX), paint(0xffffff, 0));
-  a.addM('paint', plate([v(cabX(2.66) + 0.01, 2.66, 2.78), v(cabX(2.66) + 0.01, 2.66, 3.66), v(cabX(2.8) + 0.01, 2.8, 3.63), v(cabX(2.8) + 0.01, 2.8, 2.78)], 0.035, outX), paint(C.rigIronLight));
-  a.addM('paint', plate([v(1.385, 1.55, 2.5), v(1.385, 1.55, 3.7), v(cabX(2.38) + 0.005, 2.38, 3.74), v(cabX(2.38) + 0.005, 2.38, 2.5)], 0.035, outX), paint(C.rigOxide, 0.08));
-  a.addM('kit', rod(v(1.44, 1.7, 2.32), v(1.42, 2.9, 2.32), 0.025, 5), L.steelDark);
-  // roof: light bar, red cab markers, horns
-  a.add('kit', box(2.0, 0.1, 0.14), L.blackMetal, { p: [0, 3.32, 3.3] });
-  for (const lx of [-0.78, -0.3, 0.3, 0.78]) {
-    a.add('kit', cylZ(0.11, 0.1, 0.14, 8), L.steelDark, { p: [lx, 3.45, 3.3] });
-    a.add('head', cylZ(0.075, 0.09, 0.03, 8), L.lens, { p: [lx, 3.45, 3.385] });
-  }
-  for (let i = -2; i <= 2; i++) a.add('accent', box(0.14, 0.06, 0.09), paint(0xffffff, 0), { p: [i * 0.5, 3.255, 3.56], r: [0.3, 0, 0] });
-  a.addM('kit', rod(v(0.5, 3.3, 2.5), v(0.5, 3.32, 3.1), 0.035, 6, 0.08), L.chrome);
-
-  // front face: grille, skull, caged headlights, bumper
-  a.add('kit', box(1.56, 0.86, 0.06), L.matte, { p: [0, 1.74, 4.01] });
-  for (let i = 0; i < 6; i++) a.add('kit', box(1.5, 0.035, 0.05), L.steelDark, { p: [0, 1.38 + i * 0.145, 4.04] });
-  a.push({ p: [0, 1.78, 4.08], s: 1.1 });
-  addSkull(a, paint(C.boneDirty, 0));
-  a.pop();
-  a.addM('kit', cylZ(0.16, 0.16, 0.1, 10), L.steelDark, { p: [1.07, 1.5, 4.02] });
-  a.addM('head', cylZ(0.1, 0.13, 0.03, 10), L.lens, { p: [1.07, 1.5, 4.085] });
-  a.addM('kit', rod(v(0.9, 1.5, 4.12), v(1.24, 1.5, 4.12), 0.014, 4), L.steelDark);
-  a.addM('kit', rod(v(1.07, 1.33, 4.12), v(1.07, 1.67, 4.12), 0.014, 4), L.steelDark);
-  a.add('kit', box(2.0, 0.34, 0.22), look(0x2c2d2f, 0.6, 0.8, 0), { p: [0, 0.98, 4.0] });
-  a.add('accent', box(2.3, 0.05, 0.03), paint(0xffffff, 0), { p: [0, 2.25, 4.02] });
-
-  // --- V plow with hazard stripes
-  const pb = v(0, 0.2, 4.74);
-  const pm = v(0, 1.15, 4.92);
-  const pt = v(0, 1.95, 5.0);
-  const wb = v(1.6, 0.2, 3.72);
-  const wm = planarZ(pb, wb, pm, v(1.64, 1.15, 3.87));
-  const wt = planarZ(pm, wm, pt, v(1.68, 1.58, 3.95));
-  const plowOut = v(0.6, 0, 1);
-  const plowLook = look(0x333436, 0.55, 0.8, 0.04);
-  a.addM('kit', plate([pb, wb, wm, pm], 0.07, plowOut), plowLook);
-  a.addM('kit', plate([pm, wm, wt, pt], 0.07, plowOut), look(C.rustDark, 0.7, 0.55, 0.05));
-  const plowN = wb.clone().sub(pb).cross(pm.clone().sub(pb)).normalize();
-  if (plowN.dot(plowOut) < 0) plowN.negate();
-  const Q = (u: number, w: number): V3 =>
-    pb.clone().lerp(wb, u).lerp(pm.clone().lerp(wm, u), w).addScaledVector(plowN, 0.071);
-  for (let i = 0; i < 5; i++) {
-    const u0 = 0.06 + i * 0.185;
-    a.addM('kit', plate([Q(u0, 0.05), Q(u0 + 0.085, 0.05), Q(u0 + 0.19, 0.96), Q(u0 + 0.105, 0.96)], 0.008, plowOut), look(C.hazard, 0.7, 0.2, 0.1));
-  }
-  a.add('kit', rod(v(0, 0.16, 4.76), v(0, 2.0, 5.04), 0.085, 6, 0.06, false), L.rustDark);
-  for (let i = 0; i < 4; i++) {
-    const base = pt.clone().lerp(wt, 0.12 + i * 0.26);
-    a.addM('kit', rod(base, base.clone().add(v(0.05, 0.36, 0.16)), 0.06, 4, 0), L.steelDark);
-  }
-  a.addM('kit', rod(v(1.35, 1.0, 4.1), wm.clone().add(v(-0.25, -0.2, -0.14)), 0.05, 5), L.steelDark);
-  a.addM('kit', rod(v(0.5, 1.0, 4.1), v(0.4, 0.7, 4.36), 0.05, 5), L.steelDark);
-  // teeth along the cutting edge
-  for (let i = 0; i < 5; i++) {
-    const base = pb.clone().lerp(wb, 0.1 + i * 0.2).add(v(0, 0.02, 0));
-    a.addM('kit', rod(base, base.clone().addScaledVector(plowN, 0.26).add(v(0, -0.08, 0)), 0.06, 4, 0), L.steel);
-  }
-
-  // --- twin stacks behind the cab
-  a.addM('kit', rod(v(1.2, 1.15, 1.92), v(1.2, 3.72, 1.92), 0.1, 10, 0.1, false), look(0x6f6a64, 0.38, 0.9, 0));
-  a.addM('kit', rod(v(1.2, 1.95, 1.92), v(1.2, 3.0, 1.92), 0.15, 8, 0.15, false), L.blackMetal);
-  for (let i = 0; i < 4; i++) a.addM('kit', cylY(0.16, 0.16, 0.05, 8, true), L.steelDark, { p: [1.2, 2.1 + i * 0.26, 1.92] });
-  a.addM('kit', rod(v(1.2, 3.68, 1.92), v(1.2, 3.96, 1.8), 0.1, 8, 0.115), L.rustDark);
-  a.addM('kit', box(0.5, 0.06, 0.1), L.steelDark, { p: [1.0, 2.6, 1.92] });
-
-  // --- armoured tank body: octagonal extrusion, weld plates, hoops
-  const HW = 1.36;
-  const HH = 0.85;
-  const CH = 0.4;
-  const TY = 2.15;
-  const T0 = -4.45;
-  const T1 = 1.75;
-  const oct: [number, number][] = [
-    [HW - CH, -HH],
-    [HW, -HH + CH],
-    [HW, HH - CH],
-    [HW - CH, HH],
-    [-HW + CH, HH],
-    [-HW, HH - CH],
-    [-HW, -HH + CH],
-    [-HW + CH, -HH],
-  ];
-  const octShape = (k: number): THREE.Shape => new THREE.Shape(oct.map(([x, y]) => new THREE.Vector2(x * k, y * k)));
-  const tank = new THREE.ExtrudeGeometry(octShape(1), {
-    depth: T1 - T0 - 0.14,
-    steps: 1,
-    curveSegments: 1,
-    bevelEnabled: true,
-    bevelSize: 0.07,
-    bevelThickness: 0.07,
-    bevelOffset: -0.07,
-    bevelSegments: 1,
-  });
-  tank.translate(0, TY, T0 + 0.07);
-  colorTris(tank, (cen, nor) => {
-    if (nor.y > 0.9) return C.rigIronLight;
-    if (Math.abs(nor.x) > 0.9) return cen.y < TY ? C.rigOxide : C.rigIron;
-    return C.rigIron;
-  });
-  a.add('paint', tank, paint(C.rigIron));
-  for (const hz of [1.25, 0.0, -1.3, -2.6, -3.95]) {
-    const hoop = new THREE.ExtrudeGeometry(octShape(1.03), { depth: 0.12, steps: 1, curveSegments: 1, bevelEnabled: false });
-    hoop.translate(0, TY * (1 - 1.03) + TY * 1.03 - TY * 0.03, hz);
-    a.add('kit', hoop, L.steelDark, { p: [0, TY - TY, 0] });
-  }
-  // welded patch plates (different each side)
-  const patchRand = rng(31337);
-  for (const s of [1, -1]) {
-    let z = 1.0;
-    for (let i = 0; i < 5; i++) {
-      const len = Math.min(0.7 + patchRand() * 0.6, z - (T0 + 0.25));
-      if (len < 0.3) break;
-      const y0 = TY - 0.42 + patchRand() * 0.2;
-      const y1 = TY + 0.1 + patchRand() * 0.32;
-      const sk = (patchRand() - 0.5) * 0.14;
-      const tones = [C.rigIronLight, C.rigOxide, C.rustDark, C.rigIron];
-      const tone = tones[Math.floor(patchRand() * tones.length)];
-      const x = s * (HW + 0.002);
-      a.add('paint', plate([v(x, y0, z), v(x, y0 + sk, z - len), v(x, y1, z - len + 0.05), v(x, y1 - sk, z - 0.03)], 0.035, v(s, 0, 0)), paint(tone, 0.1));
-      scatterBolts(a, [v(x + s * 0.036, y0 + 0.07, z - 0.08), v(x + s * 0.036, y1 - 0.08, z - len + 0.12)], 0.05, v(s, 0, 0), L.steelDark);
-      z -= len + 0.1 + patchRand() * 0.25;
-    }
-  }
-  // upper chamfer plates + spike rows
-  a.addM('paint', plate([v(HW - CH + 0.02, TY + HH + 0.002, 0.9), v(HW + 0.002, TY + HH - CH + 0.02, 0.9), v(HW + 0.002, TY + HH - CH + 0.02, -0.6), v(HW - CH + 0.02, TY + HH + 0.002, -0.5)], 0.03, v(1, 1, 0)), paint(C.rigOxide, 0.1));
-  a.addM('paint', plate([v(HW - CH + 0.02, TY + HH + 0.002, -2.2), v(HW + 0.002, TY + HH - CH + 0.02, -2.3), v(HW + 0.002, TY + HH - CH + 0.02, -3.7), v(HW - CH + 0.02, TY + HH + 0.002, -3.7)], 0.03, v(1, 1, 0)), paint(C.rigIronLight, 0.1));
-  for (let i = 0; i < 9; i++) {
-    const sz = 1.4 - i * 0.66;
-    a.addM('kit', rod(v(HW - CH * 0.5, TY + HH - CH * 0.5, sz), v(HW - CH * 0.5 + 0.2, TY + HH - CH * 0.5 + 0.34, sz), 0.06, 4, 0), L.steelDark);
-  }
-  // catwalk + rails
-  a.add('kit', box(1.0, 0.04, 5.9), L.steelDark, { p: [0, TY + HH + 0.03, -1.35] });
-  a.addM('kit', rod(v(0.5, TY + HH + 0.34, 1.5), v(0.5, TY + HH + 0.34, -0.2), 0.02, 4), L.steelDark);
-  a.addM('kit', rod(v(0.5, TY + HH + 0.34, -2.9), v(0.5, TY + HH + 0.34, -4.3), 0.02, 4), L.steelDark);
-  for (const pz of [1.5, 0.65, -0.2, -2.9, -3.6, -4.3]) a.addM('kit', rod(v(0.5, TY + HH, pz), v(0.5, TY + HH + 0.34, pz), 0.02, 4), L.steelDark);
-  // red accent strips along the flanks
-  a.addM('accent', box(0.03, 0.07, 5.6), paint(0xffffff, 0), { p: [HW + 0.012, TY + HH - CH - 0.09, -1.35] });
-  for (let i = 0; i < 9; i++) a.addM('kit', box(0.05, 0.11, 0.12), L.blackMetal, { p: [HW + 0.014, TY + HH - CH - 0.09, 1.3 - i * 0.665] });
-  // side skirts with teeth over the tandem axles
-  const SK = 1.54;
-  a.addM('paint', plate([v(SK, 1.14, -1.1), v(SK, 1.14, -4.35), v(SK, 1.58, -4.35), v(SK, 1.58, -1.1)], 0.035, outX), paint(C.rigIronLight, 0.05));
-  for (let i = 0; i < 7; i++) {
-    const tz = -1.1 - i * 0.464;
-    a.addM('paint', plate([v(SK, 1.15, tz), v(SK, 1.15, tz - 0.464), v(SK, 0.82 + (i % 2) * 0.1, tz - 0.232)], 0.035, outX), paint(i % 2 === 0 ? C.rigOxide : C.rigIron, 0.08));
-  }
-  for (const bz of [-1.3, -2.72, -4.15]) a.addM('kit', box(0.24, 0.08, 0.1), L.steelDark, { p: [1.44, 1.48, bz] });
-  // side gun sponsons (fixed, fire forward)
-  const GYs = 2.1;
-  let sponson = profileX(
-    [
-      [-0.5, -0.3],
-      [-0.5, 0.3],
-      [0.2, 0.3],
-      [0.5, 0.12],
-      [0.5, -0.16],
-      [0.3, -0.3],
-    ],
-    0.34,
-    0.02,
-    1,
-    1,
-  );
-  sponson = toCreasedNormals(sponson, 0.5);
-  a.addM('paint', sponson, paint(C.rigIronLight), { p: [HW + 0.15, GYs, 0.75] });
-  a.addM('kit', rod(v(HW + 0.17, GYs, 1.2), v(HW + 0.19, GYs, 2.3), 0.05, 8, 0.045, false), L.blackMetal);
-  a.addM('kit', rod(v(HW + 0.17, GYs, 1.22), v(HW + 0.18, GYs, 1.7), 0.075, 8, 0.075, false), L.steelDark);
-  a.addM('kit', rod(v(HW + 0.188, GYs, 2.2), v(HW + 0.19, GYs, 2.34), 0.07, 8, 0.07, false), L.steelDark);
-  a.addM('accent', box(0.03, 0.08, 0.3), paint(0xffffff, 0), { p: [HW + 0.325, GYs + 0.14, 0.7] });
-  // rear: tail plate, lights, bumper spikes, ladder, mud flaps, war banner
-  a.add('kit', box(2.3, 0.5, 0.05), L.blackMetal, { p: [0, 1.5, T0 - 0.02] });
-  a.addM('tail', box(0.5, 0.12, 0.04), L.lens, { p: [0.8, 1.52, T0 - 0.05] });
-  a.add('accent', box(1.0, 0.05, 0.03), paint(0xffffff, 0), { p: [0, 1.36, T0 - 0.05] });
-  a.add('kit', box(2.9, 0.22, 0.2), look(0x2c2d2f, 0.6, 0.8, 0), { p: [0, 0.9, -4.55] });
-  for (let i = -2; i <= 2; i++) a.add('kit', rod(v(i * 0.6, 0.9, -4.6), v(i * 0.6, 0.92, -4.95), 0.07, 4, 0), L.steelDark);
-  a.addM('kit', rod(v(0.25, 1.75, T0 - 0.06), v(0.25, 3.05, T0 - 0.06), 0.022, 4), L.steelDark);
-  for (let i = 0; i < 5; i++) a.add('kit', rod(v(-0.25, 1.9 + i * 0.26, T0 - 0.06), v(0.25, 1.9 + i * 0.26, T0 - 0.06), 0.018, 4), L.steelDark);
-  a.addM('kit', box(0.74, 0.66, 0.03), L.rubber, { p: [1.12, 0.62, -4.38] });
-  a.add('kit', rod(v(0.95, TY + HH, -4.2), v(1.0, 4.45, -4.36), 0.03, 5, 0.02), L.steelDark);
-  a.add('paint', plate([v(1.0, 4.4, -4.37), v(0.99, 3.62, -4.3), v(0.3, 3.74, -4.56), v(0.42, 4.2, -4.5)], 0.01, v(0.2, 0, -1)), paint(C.raiderRed, 0));
-  a.add('paint', plate([v(0.99, 3.6, -4.3), v(0.985, 3.3, -4.27), v(0.62, 3.5, -4.42)], 0.01, v(0.2, 0, -1)), paint(C.raiderRedDark, 0));
-
-  const bodyGeo = finishBody(a, 1.3, 0.5);
-
-  // --- roof mortar turret
-  const t = new Asm(71);
-  t.add('t', cylY(0.62, 0.66, 0.12, 14), L.steelDark, { p: [0, 0.06, 0] });
-  let housing = profileX(
-    [
-      [-0.56, 0.1],
-      [-0.6, 0.5],
-      [-0.22, 0.72],
-      [0.26, 0.6],
-      [0.6, 0.3],
-      [0.6, 0.1],
-    ],
-    0.92,
-    0.035,
-    1,
-    1,
-  );
-  deform(housing, (p) => {
-    p.x *= 1 - 0.18 * sm(0.2, 0.72, p.y);
-  });
-  housing = toCreasedNormals(housing, 0.5);
-  t.add('t', housing, look(0x35302d, 0.6, 0.7, 0));
-  const pitch = (50 * Math.PI) / 180;
-  const dir = v(0, Math.sin(pitch), Math.cos(pitch));
-  const breech = v(0, 0.42, 0.02);
-  const tip = breech.clone().addScaledVector(dir, 1.15);
-  t.add('t', rod(breech, tip, 0.18, 10, 0.165, false), L.blackMetal);
-  t.add('t', rod(breech.clone().addScaledVector(dir, 0.98), breech.clone().addScaledVector(dir, 1.17), 0.215, 10, 0.215, false), L.steelDark);
-  t.add('t', rod(breech.clone().addScaledVector(dir, 0.25), breech.clone().addScaledVector(dir, 0.55), 0.225, 10, 0.225, false), L.rustDark);
-  t.add('t', rod(tip.clone().addScaledVector(dir, 0.012), tip.clone().addScaledVector(dir, 0.022), 0.13, 8, 0.13, false), L.matte);
-  t.addM('t', rod(v(0.27, 0.42, 0.1), v(0.27, 0.42, 0.1).addScaledVector(dir, 0.72), 0.05, 6, 0.05, false), L.chrome);
-  t.addM('t', plate([v(0.44, 0.1, 0.62), v(0.5, 0.1, -0.3), v(0.42, 0.86, -0.2), v(0.38, 0.7, 0.5)], 0.035, v(1, 0, 0)), look(C.rigOxide, 0.75, 0.5, 0.06));
-  for (let i = -1; i <= 1; i++) {
-    t.add('t', cylY(0.07, 0.07, 0.3, 6), L.olive, { p: [i * 0.18, 0.56, -0.66] });
-    t.add('t', rod(v(i * 0.18, 0.71, -0.66), v(i * 0.18, 0.85, -0.66), 0.07, 6, 0), look(C.raiderRed, 0.6, 0.3, 0));
-  }
-  t.add('t', box(0.66, 0.24, 0.2), L.steelDark, { p: [0, 0.3, -0.66] });
-  t.add('t', cylY(0.16, 0.16, 0.05, 8), L.steel, { p: [-0.2, 0.69, -0.34], r: [0.5, 0, 0] });
-  t.add('t', rod(v(0.3, 0.6, -0.4), v(0.33, 1.3, -0.5), 0.012, 4, 0.006), L.steelDark);
-  const turretGeo = t.build('t') as THREE.BufferGeometry;
-
-  const rimLook = look(0x3e3531, 0.6, 0.7, 0);
-  const front = wheelGeometry('rigFront', { r: WR, w: 0.44, seg: 16, lugs: 10, rim: rimLook, spokes: 0, nuts: 8, hubSpike: 0.3, dual: false });
-  const rear = wheelGeometry('rigRear', { r: WR, w: 0.78, seg: 16, lugs: 10, rim: rimLook, spokes: 0, nuts: 8, hubSpike: 0, dual: true });
-
-  return {
-    ...bodyGeo,
-    turret: { geo: turretGeo, p: [0, TY + HH + 0.05, -1.55], muzzles: [{ p: [tip.x, tip.y + 0.03, tip.z + 0.03], d: [dir.x, dir.y, dir.z] }] },
-    bodyMuzzles: [
-      { p: [HW + 0.19, GYs, 2.38], d: [0, 0, 1] },
-      { p: [-HW - 0.19, GYs, 2.38], d: [0, 0, 1] },
-    ],
-    exhausts: [
-      { p: [1.2, 3.98, 1.79], d: [0, 0.92, -0.4] },
-      { p: [-1.2, 3.98, 1.79], d: [0, 0.92, -0.4] },
-    ],
-    wheels: [
-      { name: 'wheelFL', p: [1.2, WR, FZ], geo: front.left, steer: true },
-      { name: 'wheelFR', p: [-1.2, WR, FZ], geo: front.right, steer: true },
-      { name: 'wheelRL1', p: [1.1, WR, R1], geo: rear.left, steer: false },
-      { name: 'wheelRR1', p: [-1.1, WR, R1], geo: rear.right, steer: false },
-      { name: 'wheelRL2', p: [1.1, WR, R2], geo: rear.left, steer: false },
-      { name: 'wheelRR2', p: [-1.1, WR, R2], geo: rear.right, steer: false },
-    ],
-    halfExtents: { x: 1.6, y: 1.8, z: 4.85 },
-    wheelRadius: WR,
-  };
-}
-
 export function createWarRig(): VehicleModel {
-  if (!rigBlueprint) rigBlueprint = buildRig();
-  const grime = grimeTexture();
-  const paintMat = new THREE.MeshStandardMaterial({
-    name: 'warRigPaint',
-    color: 0xffffff,
-    vertexColors: true,
-    map: grime,
-    roughnessMap: grime,
-    roughness: 0.78,
-    metalness: 0.55,
-  });
-  return instantiate(rigBlueprint, {
-    name: 'warRig',
-    paint: paintMat,
-    scorchRoughness: 1,
-    headColor: 0xffe9b8,
-    headEmissive: 0xffc56a,
-    accentColor: 0xff3a1c,
-    accentEmissive: 0xff2408,
-    accentIntensity: 1.5,
-  });
+  return createHeroCar();
 }
-
-// ---------------------------------------------------------------- WRECKS (instanced set dressing)
-
-const wreckCache = new Map<number, THREE.BufferGeometry>();
-
-/** Burnt-out husk: one merged geometry with a `color` attribute, origin on ground, forward +Z, ~4.4 m long. */
-export function createWreckGeometry(variant: number): THREE.BufferGeometry {
-  const vi = variantIndex(variant);
-  const hit = wreckCache.get(vi);
-  if (hit) return hit;
-  const a = new Asm(900 + vi);
-  const rand = a.rand;
-  const tones = [0x3d2417, 0x55301b, 0x1b1613, 0x2a1f19, 0x6a3d20, 0x231c18];
-  const char = (): Look => look(tones[Math.floor(rand() * tones.length)], 1, 0, 0.12);
-  const soot = look(0x0f0d0c, 1, 0, 0.1);
-  /** Scorched shell: patchy rust / soot per panel, sagging and dented. */
-  const shell = (pts: readonly P2[], width: number, amt: number): THREE.BufferGeometry => {
-    const g = profileX(pts, width, 0, 2);
-    colorTris(g, (cen, nor) => {
-      if (nor.y < -0.5) return 0x0f0d0c;
-      // both triangles of a panel share a normal, so key panels by normal (+ a coarse band on the flanks)
-      const key = Math.abs(nor.x) > 0.7 ? Math.sign(nor.x) * 7 + Math.round(cen.z * 0.8) : Math.round(nor.y * 9) * 3 + Math.round(nor.z * 9) + (cen.x > 0 ? 40 : 0);
-      const h = Math.sin(key * 12.9898 + vi * 3.3) * 43758.5453;
-      return tones[Math.floor((h - Math.floor(h)) * tones.length)];
-    });
-    return deform(g, (p) => {
-      // position-hashed so welded corners stay welded
-      const h = Math.sin(p.x * 12.9898 + p.y * 78.233 + p.z * 37.719 + vi * 4.1) * 43758.5453;
-      const n = h - Math.floor(h) - 0.5;
-      p.y += n * amt * (p.y > 0.5 ? 1 : 0.2);
-      p.z += n * amt * 0.5;
-      p.x *= 1 - 0.07 * sm(0.55, 0.95, p.y) - 0.05 * sm(1.7, 2.2, Math.abs(p.z));
-    });
-  };
-  const wheel = (x: number, z: number, tilt: number, tyre: boolean): void => {
-    const s = Math.sign(x);
-    if (tyre) a.add('g', cylX(0.33, 0.33, 0.22, 9), soot, { p: [x, 0.3, z], r: [0, tilt, 0] });
-    a.add('g', cylX(0.2, 0.2, tyre ? 0.25 : 0.2, 7), look(0x4a2e1e, 1, 0, 0.1), { p: [x + s * 0.005, tyre ? 0.3 : 0.2, z], r: [0, tilt, 0] });
-  };
-  const pillars = (posts: [number, number, number, number, number][], y0: number): void => {
-    for (const [x0, z0, x1, y1, z1] of posts) a.addM('g', beam(v(x0, y0, z0), v(x1, y1, z1), 0.06, 0.08), char());
-  };
-  const arch = (cz: number): P2[] => archPts(cz, 0.3, 0.4, 0.2, 4);
-
-  if (vi === 0) {
-    // sedan on its rims, hood sprung, roof sagging
-    const body: P2[] = [
-      [2.08, 0.2],
-      [2.2, 0.42],
-      [2.16, 0.7],
-      [1.0, 0.86],
-      [-1.2, 0.88],
-      [-2.12, 0.82],
-      [-2.2, 0.45],
-      [-2.05, 0.2],
-      ...arch(-1.35),
-      ...arch(1.35),
-    ];
-    a.add('g', shell(body, 1.74, 0.07), char());
-    a.add('g', plate([v(0.76, 0.84, 0.98), v(-0.76, 0.84, 0.98), v(-0.72, 1.3, 1.9), v(0.72, 1.38, 1.84)], 0.04, AXIS_Y), look(0x6a3d20, 1, 0, 0));
-    a.add('g', box(1.34, 0.06, 1.3), char(), { p: [0, 1.3, -0.45], r: [0.06, 0, 0.05] });
-    pillars(
-      [
-        [0.74, 0.92, 0.64, 1.3, 0.2],
-        [0.76, -0.36, 0.66, 1.3, -0.4],
-        [0.74, -1.5, 0.63, 1.28, -1.08],
-      ],
-      0.84,
-    );
-    a.add('g', box(1.2, 0.3, 0.5), soot, { p: [0, 0.78, -0.1], r: [-0.2, 0, 0] });
-    a.add('g', box(1.2, 0.34, 0.4), soot, { p: [0, 0.8, -0.95], r: [-0.2, 0, 0] });
-    a.add('g', box(0.5, 0.3, 0.6), soot, { p: [0.1, 0.72, 1.45] });
-    wheel(0.8, 1.35, 0.25, false);
-    wheel(-0.8, 1.35, -0.1, true);
-    wheel(0.8, -1.35, 0, true);
-    wheel(-0.8, -1.35, 0.05, false);
-    a.add('g', box(1.8, 0.14, 0.1), soot, { p: [0, 0.36, 2.24], r: [0, 0.07, 0.06] });
-  } else if (vi === 1) {
-    // hatchback slumped on a collapsed corner, door hanging open
-    const body: P2[] = [
-      [1.98, 0.2],
-      [2.18, 0.4],
-      [2.14, 0.64],
-      [1.1, 0.84],
-      [-2.0, 0.9],
-      [-2.2, 0.5],
-      [-2.02, 0.2],
-      ...arch(-1.38),
-      ...arch(1.32),
-    ];
-    a.push({ r: [0.05, 0, -0.075], p: [0, -0.03, 0] });
-    a.add('g', shell(body, 1.7, 0.06), char());
-    a.add('g', box(1.3, 0.06, 1.9), char(), { p: [0, 1.36, -0.95], r: [-0.03, 0, 0] });
-    pillars(
-      [
-        [0.72, 0.95, 0.63, 1.36, 0.0],
-        [0.75, -0.6, 0.64, 1.36, -0.62],
-        [0.74, -2.05, 0.63, 1.36, -1.88],
-      ],
-      0.84,
-    );
-    a.add('g', plate([v(0.84, 0.36, 0.9), v(0.84, 0.88, 0.9), v(1.45, 0.9, 0.22), v(1.45, 0.38, 0.22)], 0.05, v(1, 0, 1)), look(0x55301b, 1, 0, 0));
-    a.add('g', box(1.2, 0.34, 0.5), soot, { p: [0, 0.78, -0.1], r: [-0.2, 0, 0] });
-    a.add('g', box(1.2, 0.3, 0.9), soot, { p: [0, 0.74, -1.3] });
-    wheel(0.8, -1.38, 0, true);
-    wheel(-0.8, -1.38, 0.08, true);
-    wheel(0.8, 1.32, 0.5, false);
-    a.pop();
-    a.add('g', cylX(0.33, 0.33, 0.22, 9), soot, { p: [-1.3, 0.11, 1.95], r: [0, 0.4, 1.5] });
-  } else {
-    // pickup with a crushed cab and a bed full of debris
-    const body: P2[] = [
-      [2.02, 0.24],
-      [2.2, 0.46],
-      [2.16, 0.8],
-      [0.9, 0.94],
-      [-2.16, 0.92],
-      [-2.2, 0.5],
-      [-2.05, 0.24],
-      ...archPts(-1.4, 0.32, 0.42, 0.24, 4),
-      ...archPts(1.38, 0.32, 0.42, 0.24, 4),
-    ];
-    a.add('g', shell(body, 1.8, 0.05), char());
-    a.add('g', box(1.44, 0.07, 1.0), char(), { p: [0, 1.34, 0.14], r: [0.16, 0, -0.1] });
-    pillars(
-      [
-        [0.76, 0.82, 0.68, 1.42, 0.5],
-        [0.78, -0.42, 0.7, 1.26, -0.36],
-      ],
-      0.9,
-    );
-    a.add('g', box(1.5, 0.44, 0.07), char(), { p: [0, 1.1, -0.42] });
-    a.addM('g', box(0.07, 0.34, 1.72), char(), { p: [0.82, 1.06, -1.3] });
-    a.add('g', box(1.66, 0.32, 0.07), char(), { p: [0, 0.96, -2.26], r: [-0.6, 0, 0] });
-    a.add('g', box(0.7, 0.34, 0.5), soot, { p: [0.2, 1.06, -1.2], r: [0.2, 0.5, 0.1] });
-    a.add('g', cylX(0.25, 0.25, 0.9, 8), look(0x55301b, 1, 0, 0), { p: [-0.1, 1.14, -1.8], r: [0, 0.3, 0] });
-    a.add('g', box(1.2, 0.3, 0.6), soot, { p: [0, 0.84, 0.15] });
-    wheel(0.84, 1.38, -0.2, true);
-    wheel(-0.84, 1.38, 0, false);
-    wheel(0.84, -1.4, 0, true);
-    wheel(-0.84, -1.4, 0, true);
-    a.add('g', box(1.86, 0.16, 0.12), soot, { p: [0.05, 0.42, 2.24], r: [0, -0.08, -0.1] });
-  }
-
-  const geo = a.build('g') as THREE.BufferGeometry;
-  geo.deleteAttribute('uv');
-  // sit exactly on the ground, ash on upward faces, dust at the sills
-  geo.computeBoundingBox();
-  const minY = geo.boundingBox ? geo.boundingBox.min.y : 0;
-  geo.translate(0, -minY, 0);
-  const col = geo.getAttribute('color') as THREE.BufferAttribute;
-  const nor = geo.getAttribute('normal') as THREE.BufferAttribute;
-  const ash = new THREE.Color(0x6a6058);
-  for (let i = 0; i < col.count; i++) {
-    const k = 0.28 * Math.max(0, nor.getY(i));
-    col.setXYZ(i, lerp(col.getX(i), ash.r, k), lerp(col.getY(i), ash.g, k), lerp(col.getZ(i), ash.b, k));
-  }
-  dustGradient(geo, 0.4, 0.4);
-  geo.computeBoundingBox();
-  geo.computeBoundingSphere();
-  wreckCache.set(vi, geo);
-  return geo;
+export function createWreckGeometry(_variant: number): THREE.BufferGeometry {
+  void [planarZ, archPts, hazardPanel, glyph, addSkull, finishBody, scrapPaint, sanitizeLog, textureCount, rag, RING_LO, L.hazard];
+  return box(1, 1, 1);
 }

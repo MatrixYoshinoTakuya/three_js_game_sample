@@ -30,6 +30,9 @@ export const HERO_TUNING: VehicleTuning = {
 export type VehicleControls = { throttle: number; steer: number; handbrake: boolean; boost: boolean };
 
 const TWO_PI = Math.PI * 2;
+/** Above this speed a soft (wreck) collider is smashed aside, keeping PLOW_KEEP of the car's speed. */
+export const PLOW_SPEED = 14;
+const PLOW_KEEP = 0.65;
 
 export function wrapAngle(a: number): number {
   let r = a % TWO_PI;
@@ -58,6 +61,14 @@ export class Vehicle {
   impact = 0;
   impactNx = 0;
   impactNz = 0;
+  /** When true (the player), a fast hit on a `soft` collider ploughs through it instead of stopping. */
+  plow = false;
+  /** Speed (m/s) at which a soft collider was ploughed since the owner last cleared it, 0 if none. */
+  softImpact = 0;
+  softX = 0;
+  softZ = 0;
+  private ghost: Aabb | null = null;
+  private ghostSeen = false;
   readonly controls: VehicleControls = { throttle: 0, steer: 0, handbrake: false, boost: false };
   readonly circleOffset: number;
   readonly circleRadius: number;
@@ -88,6 +99,8 @@ export class Vehicle {
     this.lastForward = 0;
     this.roll = 0;
     this.pitch = 0;
+    this.ghost = null;
+    this.softImpact = 0;
     this.y = groundHeight(x, z);
     this.syncVisual(0);
   }
@@ -144,8 +157,10 @@ export class Vehicle {
     this.x += this.vx * dt;
     this.z += this.vz * dt;
 
+    this.ghostSeen = false;
     this.resolveStatic(grid, 1);
     this.resolveStatic(grid, -1);
+    if (!this.ghostSeen) this.ghost = null;
 
     const fx2 = Math.sin(this.heading);
     const fz2 = Math.cos(this.heading);
@@ -191,6 +206,24 @@ export class Vehicle {
       let dz = cz - pz;
       const d2 = dx * dx + dz * dz;
       if (d2 >= r * r) return;
+      if (box === this.ghost) {
+        // still passing through the wreck that was just ploughed aside
+        this.ghostSeen = true;
+        return;
+      }
+      if (box.soft && this.plow) {
+        const speed = Math.hypot(this.vx, this.vz);
+        if (speed > PLOW_SPEED) {
+          this.vx *= PLOW_KEEP;
+          this.vz *= PLOW_KEEP;
+          this.softImpact = speed;
+          this.softX = px;
+          this.softZ = pz;
+          this.ghost = box;
+          this.ghostSeen = true;
+          return;
+        }
+      }
       if (d2 > 1e-8) {
         const d = Math.sqrt(d2);
         push(dx / d, dz / d, r - d);

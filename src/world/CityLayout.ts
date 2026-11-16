@@ -33,7 +33,8 @@ export type InstanceBox = {
   tint: number;
 };
 
-export type Aabb = { minX: number; maxX: number; minZ: number; maxZ: number };
+/** `soft` boxes (street wrecks) can be ploughed through by a fast, heavy hit instead of stopping the car dead. */
+export type Aabb = { minX: number; maxX: number; minZ: number; maxZ: number; soft?: boolean };
 
 export type PropPlacement = { x: number; y: number; z: number; rot: number; scale: number; variant: number; flag: boolean };
 
@@ -121,8 +122,9 @@ export function generateCity(seed: number): CityLayout {
   const curb = CITY.curbHeight;
   const roofHeights: { x: number; z: number; h: number; hw: number; hd: number }[] = [];
 
-  const addCollider = (x: number, z: number, hw: number, hd: number) => {
-    layout.colliders.push({ minX: x - hw, maxX: x + hw, minZ: z - hd, maxZ: z + hd });
+  const addCollider = (x: number, z: number, hw: number, hd: number, soft = false) => {
+    if (soft) layout.colliders.push({ minX: x - hw, maxX: x + hw, minZ: z - hd, maxZ: z + hd, soft: true });
+    else layout.colliders.push({ minX: x - hw, maxX: x + hw, minZ: z - hd, maxZ: z + hd });
   };
 
   const addRubblePile = (x: number, z: number, radius: number, count: number) => {
@@ -471,7 +473,7 @@ export function generateCity(seed: number): CityLayout {
             rot: (axis === 0 ? 0 : Math.PI / 2) + range(-0.7, 0.7) + (chance(0.5) ? Math.PI : 0),
             scale: 1, variant: pick(3), flag: chance(0.18),
           });
-          addCollider(wx, wz, 1.7, 1.7);
+          addCollider(wx, wz, 1.7, 1.7, true);
         }
         for (let s = 0; s < 5; s += 1) {
           const t = range(from - 10, to + 10);
@@ -509,7 +511,7 @@ export function generateCity(seed: number): CityLayout {
   // guaranteed atmosphere near the start
   layout.barrels.push({ x: layout.start.x - 20, y: curb, z: layout.start.z + 34, rot: 0, scale: 1, variant: 0, flag: true });
   layout.wrecks.push({ x: layout.start.x - 13, y: 0, z: layout.start.z + 22, rot: 0.5, scale: 1, variant: 1, flag: true });
-  addCollider(layout.start.x - 13, layout.start.z + 22, 1.7, 1.7);
+  addCollider(layout.start.x - 13, layout.start.z + 22, 1.7, 1.7, true);
 
   // ------------------------------------------------------------ cables between rooftops
   for (let n = 0; n < roofHeights.length; n += 1) {

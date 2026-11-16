@@ -1,4 +1,4 @@
-import type { HudFrame, MinimapWorld } from '../game/contracts';
+import type { HudBlip, HudFrame, MinimapWorld } from '../game/contracts';
 
 const RANGE_M = 220;
 const ASH = '233,225,210';
@@ -191,7 +191,7 @@ export class Minimap {
 
   private blip(
     ctx: CanvasRenderingContext2D,
-    kind: 'enemy' | 'boss' | 'objective' | 'mortar',
+    kind: HudBlip['kind'],
     dx: number,
     dz: number,
     sin: number,
@@ -208,8 +208,8 @@ export class Minimap {
     const rim = R - 7 * u;
     let clamped = false;
     if (d > rim) {
-      if (kind === 'enemy' || kind === 'mortar') {
-        if (d > R) return;
+      if (kind === 'enemy' || kind === 'mortar' || kind === 'patrol' || kind === 'pickup') {
+        if (d > (kind === 'pickup' ? rim : R)) return;
       } else {
         ox = (ox / d) * rim;
         oy = (oy / d) * rim;
@@ -239,6 +239,43 @@ export class Minimap {
       ctx.closePath();
       ctx.fill();
       ctx.stroke();
+    } else if (kind === 'pickup') {
+      ctx.fillStyle = TEAL;
+      ctx.beginPath();
+      ctx.arc(x, y, 1.8 * u, 0, TAU);
+      ctx.fill();
+    } else if (kind === 'patrol') {
+      // Unaware hostile: hollow amber triangle.
+      ctx.fillStyle = 'rgba(14,10,8,0.7)';
+      ctx.strokeStyle = AMBER;
+      ctx.lineWidth = 1.5 * u;
+      ctx.lineJoin = 'miter';
+      ctx.beginPath();
+      ctx.moveTo(x, y - 4.6 * u);
+      ctx.lineTo(x + 4.2 * u, y + 3.2 * u);
+      ctx.lineTo(x - 4.2 * u, y + 3.2 * u);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    } else if (kind === 'cache') {
+      const s = 5.4 * u;
+      ctx.fillStyle = clamped ? 'rgba(14,10,8,0.7)' : 'rgba(95,227,208,0.28)';
+      ctx.strokeStyle = TEAL;
+      ctx.lineWidth = 1.6 * u;
+      ctx.beginPath();
+      ctx.moveTo(x, y - s);
+      ctx.lineTo(x + s * 0.87, y - s * 0.5);
+      ctx.lineTo(x + s * 0.87, y + s * 0.5);
+      ctx.lineTo(x, y + s);
+      ctx.lineTo(x - s * 0.87, y + s * 0.5);
+      ctx.lineTo(x - s * 0.87, y - s * 0.5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      if (!clamped) {
+        ctx.fillStyle = TEAL;
+        ctx.fillRect(x - 1.3 * u, y - 1.3 * u, 2.6 * u, 2.6 * u);
+      }
     } else if (kind === 'objective') {
       ctx.strokeStyle = TEAL;
       ctx.lineWidth = 2 * u;

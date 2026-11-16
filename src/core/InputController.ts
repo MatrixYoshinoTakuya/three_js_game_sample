@@ -8,6 +8,8 @@ export type DriveIntents = {
   fire: boolean;
   boost: boolean;
   handbrake: boolean;
+  /** Secondary weapon: true for exactly one update per press (E / Q / right mouse / touch). */
+  missile: boolean;
 };
 
 const PREVENT = new Set(['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']);
@@ -17,8 +19,10 @@ export class InputController {
   private readonly keys = new Set<string>();
   private readonly pressed = new Set<string>();
   private mouseFire = false;
+  private mouseMissile = false;
+  private touchMissile = false;
   private steerSmoothed = 0;
-  readonly intents: DriveIntents = { steer: 0, throttle: 0, fire: false, boost: false, handbrake: false };
+  readonly intents: DriveIntents = { steer: 0, throttle: 0, fire: false, boost: false, handbrake: false, missile: false };
 
   constructor(private readonly canvas: HTMLCanvasElement) {
     window.addEventListener('keydown', this.onKeyDown);
@@ -42,10 +46,12 @@ export class InputController {
   private readonly onBlur = () => {
     this.keys.clear();
     this.mouseFire = false;
+    this.mouseMissile = false;
   };
 
   private readonly onMouseDown = (event: MouseEvent) => {
     if (event.button === 0) this.mouseFire = true;
+    if (event.button === 2) this.mouseMissile = true;
   };
 
   private readonly onMouseUp = (event: MouseEvent) => {
@@ -83,6 +89,11 @@ export class InputController {
     out.fire = this.down('Space', 'KeyJ', 'KeyF') || this.mouseFire;
     out.boost = this.down('ShiftLeft', 'ShiftRight', 'KeyK');
     out.handbrake = this.down('KeyX', 'KeyL', 'ControlLeft');
+    // edge-triggered: one launch per press, whichever device asked
+    const touchMissile = touch.active && touch.missile === true;
+    out.missile = this.consume('KeyE', 'KeyQ') || this.mouseMissile || (touchMissile && !this.touchMissile);
+    this.mouseMissile = false;
+    this.touchMissile = touchMissile;
     if (touch.active) {
       if (Math.abs(touch.steer) > Math.abs(steer)) steer = touch.steer;
       if (Math.abs(touch.throttle) > Math.abs(throttle)) throttle = touch.throttle;

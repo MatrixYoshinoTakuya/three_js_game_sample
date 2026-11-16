@@ -191,8 +191,8 @@ export class VfxSystem {
 
   constructor(lowSpec: boolean) {
     this.group.name = 'vfx';
-    this.glow = new ParticleLayer(lowSpec ? 500 : 900, true);
-    this.smoke = new ParticleLayer(lowSpec ? 350 : 700, false);
+    this.glow = new ParticleLayer(lowSpec ? 720 : 1300, true);
+    this.smoke = new ParticleLayer(lowSpec ? 480 : 900, false);
     this.group.add(this.smoke.points, this.glow.points);
 
     const tracerGeometry = new THREE.BoxGeometry(1, 1, 1);
@@ -427,6 +427,74 @@ export class VfxSystem {
         life: 1.4, size0: 0.14, size1: 0.05, r: 5, g: 2, b: 0.4, a: 1, drag: 0.4, gravity: -0.6,
       });
     }
+  }
+
+  /** Rocket motor: white-hot core, orange flame and a lingering grey smoke rope. */
+  missileTrail(x: number, y: number, z: number, dx: number, dy: number, dz: number, boostPhase: boolean): void {
+    this.glow.spawn({ x, y, z, vx: -dx * 6, vy: -dy * 6, vz: -dz * 6, life: 0.07, size0: boostPhase ? 2.6 : 1.7, size1: 0.5, r: 7, g: 5, b: 3, a: 1 });
+    this.glow.spawn({
+      x: x - dx * 0.5, y: y - dy * 0.5, z: z - dz * 0.5,
+      vx: -dx * 14 + this.spread(1.5), vy: -dy * 14 + this.spread(1.5), vz: -dz * 14 + this.spread(1.5),
+      life: 0.16 + this.rand() * 0.1, size0: 1.0, size1: 0.2, r: 6, g: 2.4, b: 0.5, a: 0.95, drag: 3, fade: 0.2,
+    });
+    for (let n = 0; n < 2; n += 1) {
+      const back = n * 0.8 + this.rand() * 0.6;
+      this.smoke.spawn({
+        x: x - dx * back + this.spread(0.12), y: y - dy * back + this.spread(0.12), z: z - dz * back + this.spread(0.12),
+        vx: this.spread(0.6), vy: 0.5 + this.rand() * 0.6, vz: this.spread(0.6),
+        life: 1.1 + this.rand() * 0.9, size0: 0.45, size1: 2.4 + this.rand(),
+        r: 0.62, g: 0.6, b: 0.58, a: 0.34, drag: 1.2,
+      });
+    }
+  }
+
+  /** Pickup collected: a tinted ring of motes that rise and a soft flash. */
+  collectBurst(x: number, y: number, z: number, r: number, g: number, b: number, big: boolean): void {
+    const count = big ? 16 : 7;
+    this.glow.spawn({ x, y, z, vx: 0, vy: 0, vz: 0, life: 0.16, size0: big ? 4.2 : 2.2, size1: 0.4, r: r * 3.5, g: g * 3.5, b: b * 3.5, a: 1 });
+    for (let i = 0; i < count; i += 1) {
+      const a = (i / count) * Math.PI * 2 + this.rand();
+      const s = (big ? 5 : 3) + this.rand() * 3;
+      this.glow.spawn({
+        x, y, z, vx: Math.cos(a) * s, vy: 2.5 + this.rand() * 4.5, vz: Math.sin(a) * s,
+        life: 0.35 + this.rand() * 0.35, size0: 0.32, size1: 0.05, r: r * 4.5, g: g * 4.5, b: b * 4.5, a: 1, drag: 2.4, gravity: -3,
+      });
+    }
+  }
+
+  /** Burning fuel: a rolling orange fireball with black smoke on top of the regular blast. */
+  fuelBlast(x: number, y: number, z: number, scale: number): void {
+    this.explosion(x, y, z, scale);
+    for (let i = 0; i < 10; i += 1) {
+      const a = this.rand() * Math.PI * 2;
+      const s = this.rand() * 4 * scale;
+      this.glow.spawn({
+        x: x + Math.cos(a) * s * 0.3, y: y + 0.8 + this.rand() * 1.5, z: z + Math.sin(a) * s * 0.3,
+        vx: Math.cos(a) * s, vy: 7 + this.rand() * 9, vz: Math.sin(a) * s,
+        life: 0.7 + this.rand() * 0.6, size0: 3.2 * scale, size1: 5.5 * scale, r: 6, g: 1.9, b: 0.25, a: 0.9, drag: 1.8, fade: 0.05,
+      });
+      this.smoke.spawn({
+        x, y: y + 2 + this.rand() * 2, z, vx: Math.cos(a) * s * 0.6, vy: 6 + this.rand() * 6, vz: Math.sin(a) * s * 0.6,
+        life: 2.6 + this.rand() * 1.6, size0: 2.4, size1: 9 * scale, r: 0.035, g: 0.03, b: 0.03, a: 0.7, drag: 0.9,
+      });
+    }
+  }
+
+  /** Loose metal thrown from a hit (ploughed wrecks, scrap drops). */
+  scrapSpray(x: number, y: number, z: number, count: number, scale: number): void {
+    this.spawnDebris(x, y, z, count, scale);
+  }
+
+  /** A short vertical flare (cache opened, upgrade taken). */
+  flare(x: number, y: number, z: number, r: number, g: number, b: number): void {
+    for (let i = 0; i < 14; i += 1) {
+      this.glow.spawn({
+        x: x + this.spread(1.2), y: y + this.rand() * 1.5, z: z + this.spread(1.2),
+        vx: this.spread(1.5), vy: 9 + this.rand() * 14, vz: this.spread(1.5),
+        life: 0.6 + this.rand() * 0.6, size0: 0.9, size1: 0.1, r: r * 4, g: g * 4, b: b * 4, a: 1, drag: 1.4,
+      });
+    }
+    this.glow.spawn({ x, y: y + 1.5, z, vx: 0, vy: 0, vz: 0, life: 0.3, size0: 9, size1: 2, r: r * 3, g: g * 3, b: b * 3, a: 1 });
   }
 
   explosion(x: number, y: number, z: number, scale: number): void {

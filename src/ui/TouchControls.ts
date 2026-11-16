@@ -1,6 +1,6 @@
 import type { TouchIntents } from '../game/contracts';
 
-type HoldKey = 'fire' | 'boost' | 'handbrake';
+type HoldKey = 'fire' | 'boost' | 'handbrake' | 'missile';
 
 const DEADZONE = 0.14;
 
@@ -60,6 +60,7 @@ export class TouchControls {
     this.intents.fire = false;
     this.intents.boost = false;
     this.intents.handbrake = false;
+    this.intents.missile = false;
   }
 
   private readonly onStickDown = (e: PointerEvent): void => {
@@ -136,5 +137,6 @@ export class TouchControls {
     if (key === 'fire') this.intents.fire = down;
     else if (key === 'boost') this.intents.boost = down;
     else if (key === 'handbrake') this.intents.handbrake = down;
+    else if (key === 'missile') this.intents.missile = down;
   }
 }
