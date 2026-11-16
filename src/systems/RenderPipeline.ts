@@ -60,6 +60,10 @@ class SceneFogPass extends Pass {
         ${ATMOSPHERE_GLSL}
         void main() {
           vec4 scene = texture2D(tColor, vUv);
+          // A single NaN/Inf texel (pow of a negative, a zero-length normal...) would be
+          // smeared over the whole frame by the bloom blur, so scrub them here.
+          if (any(isnan(scene.rgb)) || any(isinf(scene.rgb))) scene.rgb = vec3(0.0);
+          scene.rgb = clamp(scene.rgb, 0.0, 64.0);
           float depth = texture2D(tDepth, vUv).x;
           if (depth >= 0.999995) {
             gl_FragColor = vec4(scene.rgb, 1.0);
@@ -82,7 +86,9 @@ class SceneFogPass extends Pass {
           float sunAmt = max(dot(rd, uSunDir), 0.0);
           haze += vec3(1.3, 0.6, 0.2) * pow(sunAmt, 6.0) * 0.3;
           haze = min(haze, vec3(2.4, 1.5, 0.8));
-          gl_FragColor = vec4(mix(scene.rgb, haze, fog), 1.0);
+          vec3 fogged = mix(scene.rgb, haze, clamp(fog, 0.0, 1.0));
+          if (any(isnan(fogged)) || any(isinf(fogged))) fogged = scene.rgb;
+          gl_FragColor = vec4(fogged, 1.0);
         }`,
       depthTest: false,
       depthWrite: false,
@@ -94,6 +100,13 @@ class SceneFogPass extends Pass {
 
   override setSize(width: number, height: number): void {
     this.target.setSize(width, height);
+  }
+
+  /** Change the MSAA sample count; the GPU resources are rebuilt on the next render. */
+  setSamples(samples: number): void {
+    if (this.target.samples === samples) return;
+    this.target.samples = samples;
+    this.target.dispose();
   }
 
   override render(renderer: THREE.WebGLRenderer, writeBuffer: THREE.WebGLRenderTarget): void {
@@ -173,6 +186,7 @@ class FinalGradePass extends Pass {
           return clamp(outputMat * color, 0.0, 1.0);
         }
         vec3 toSrgb(vec3 c) {
+          c = max(c, 0.0);
           return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
         }
 
@@ -214,7 +228,8 @@ class FinalGradePass extends Pass {
             color += shafts / float(RAY_SAMPLES) * uSunWeight * 1.25 * vec3(1.0, 0.72, 0.45);
           }
 
-          color *= uExposure;
+          if (any(isnan(color)) || any(isinf(color))) color = vec3(0.0);
+          color = max(color, 0.0) * uExposure;
           // split-tone grade in scene-referred space: cool shadows, ember highlights
           float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
           color = mix(color, color * vec3(0.90, 1.0, 1.10), (1.0 - smoothstep(0.0, 0.35, luma)) * 0.55);
@@ -270,6 +285,12 @@ export class RenderPipeline {
   private readonly sunWorld = new THREE.Vector3();
   private readonly forward = new THREE.Vector3();
   readonly postPasses = 2;
+  /**
+   * 0 = full pipeline. Each step trades fidelity for compatibility when a GPU
+   * returns a black frame: 1 = no MSAA, 2 = no bloom, 3 = plain forward render.
+   */
+  safeLevel = 0;
+  private readonly scene: THREE.Scene;
 
   constructor(
     private readonly renderer: THREE.WebGLRenderer,
@@ -277,6 +298,7 @@ export class RenderPipeline {
     private readonly camera: THREE.PerspectiveCamera,
     lowSpec: boolean,
   ) {
+    this.scene = scene;
     renderer.toneMapping = THREE.NoToneMapping;
     this.composer = new EffectComposer(renderer);
     this.fogPass = new SceneFogPass(scene, camera, lowSpec ? 0 : 4);
@@ -285,6 +307,20 @@ export class RenderPipeline {
     this.composer.addPass(this.fogPass);
     this.composer.addPass(this.bloomPass);
     this.composer.addPass(this.finalPass);
+  }
+
+  setSafeLevel(level: number): void {
+    this.safeLevel = Math.max(0, Math.min(3, Math.floor(level)));
+    if (this.safeLevel >= 1) this.fogPass.setSamples(0);
+    this.bloomPass.enabled = this.safeLevel < 2;
+    if (this.safeLevel >= 3) {
+      this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      this.renderer.toneMappingExposure = 0.9;
+      this.scene.fog = new THREE.FogExp2(0x9a6444, 0.0021);
+    } else {
+      this.renderer.toneMapping = THREE.NoToneMapping;
+      this.scene.fog = null;
+    }
   }
 
   setExposure(value: number): void {
@@ -302,6 +338,11 @@ export class RenderPipeline {
   }
 
   render(state: RenderFrameState): void {
+    if (this.safeLevel >= 3) {
+      this.renderer.setRenderTarget(null);
+      this.renderer.render(this.scene, this.camera);
+      return;
+    }
     const uniforms = this.finalPass.material.uniforms;
     // project the sun to screen space for the light-shaft march
     this.sunWorld.setFromMatrixPosition(this.camera.matrixWorld).addScaledVector(SUN_DIRECTION, 1000);

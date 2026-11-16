@@ -16,10 +16,10 @@ export const SUN_DIRECTION = new THREE.Vector3(
 export const ATMOSPHERE_GLSL = /* glsl */ `
 vec3 ashAtmosphere(vec3 rd, vec3 sunDir) {
   float h = clamp(rd.y, 0.0, 1.0);
-  float sunAmt = max(dot(rd, sunDir), 0.0);
-  vec2 flatRd = normalize(rd.xz + vec2(1e-5));
+  float sunAmt = clamp(dot(rd, sunDir), 0.0, 1.0);
+  vec2 flatRd = normalize(rd.xz + vec2(1e-4, 1e-4));
   vec2 flatSun = normalize(sunDir.xz);
-  float az = dot(flatRd, flatSun) * 0.5 + 0.5;
+  float az = clamp(dot(flatRd, flatSun) * 0.5 + 0.5, 0.0, 1.0);
   vec3 zenith = vec3(0.085, 0.115, 0.23);
   vec3 upper = vec3(0.30, 0.25, 0.36);
   vec3 horizonAway = vec3(0.40, 0.29, 0.31);
@@ -70,7 +70,8 @@ function createSkyMaterial(disc: number): THREE.ShaderMaterial {
       void main() {
         vDir = position;
         vec4 pos = projectionMatrix * viewMatrix * vec4(cameraPosition + position * 100.0, 1.0);
-        gl_Position = pos.xyww;
+        // just inside the far plane: exact w can be clipped on some GPUs
+        gl_Position = vec4(pos.xy, pos.w * 0.9999995, pos.w);
       }`,
     fragmentShader: /* glsl */ `
       uniform vec3 uSunDir;

@@ -38,6 +38,10 @@ interface ThreeGameDiagnostics {
     postPasses: number;
     shadowMapSize: number;
     shadowLights: number;
+    /** 0 = full post pipeline; 1-3 = automatic compatibility fallbacks. */
+    safeLevel: number;
+    outputVerified: boolean;
+    brightestSample: number;
   };
   canvas: {
     clientWidth: number;

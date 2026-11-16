@@ -655,9 +655,9 @@ export function buildRelayTower(position: { x: number; z: number }): RelayTower 
       varying vec3 vViewDir;
       void main() {
         float facing = abs(dot(normalize(vNormalV), normalize(vViewDir)));
-        float core = pow(facing, 2.2);
+        float core = pow(clamp(facing, 0.0, 1.0), 2.2);
         float rise = 0.75 + 0.25 * sin(vUv.y * 90.0 - uTime * 5.0);
-        float fade = pow(1.0 - vUv.y, 1.6) * smoothstep(0.0, 0.01, vUv.y);
+        float fade = pow(clamp(1.0 - vUv.y, 0.0, 1.0), 1.6) * smoothstep(0.0, 0.01, vUv.y);
         gl_FragColor = vec4(uColor * uIntensity * core * rise * fade, 1.0);
       }`,
     blending: THREE.AdditiveBlending,

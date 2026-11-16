@@ -126,6 +126,11 @@ export class Game {
   private viewH = 0;
   private viewDpr = 0;
   private readonly adaptive: boolean;
+  private readonly forcedSafeLevel: number;
+  private renderVerified = false;
+  private blackFrames = 0;
+  private lastBrightest = -1;
+  private probe: Uint8Array | null = null;
   private resolutionScale = 1;
   private slowTime = 0;
   private fastTime = 0;
@@ -135,6 +140,7 @@ export class Game {
     this.lowSpec = quality === 'low' || (quality !== 'high' && (window.matchMedia('(pointer: coarse)').matches || Math.min(window.innerWidth, window.innerHeight) < 520));
     this.maxDpr = this.lowSpec ? 1.25 : 1.5;
     this.adaptive = quality === null;
+    this.forcedSafeLevel = Number(new URLSearchParams(window.location.search).get('safe') ?? 0) || 0;
     this.hud.setLoadingProgress(0.1);
 
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: false, powerPreference: 'high-performance' });
@@ -161,6 +167,9 @@ export class Game {
     this.scene.add(this.relay.group);
     this.atmosphere = new Atmosphere(this.scene, this.renderer, this.lowSpec);
     this.pipeline = new RenderPipeline(this.renderer, this.scene, this.camera, this.lowSpec);
+    if (this.forcedSafeLevel > 0) this.pipeline.setSafeLevel(this.forcedSafeLevel);
+    // test switch: blank the post chain so the automatic fallback can be exercised
+    if (new URLSearchParams(window.location.search).has('debugBlack')) this.pipeline.setExposure(0);
     this.vfx = new VfxSystem(this.lowSpec);
     this.scene.add(this.vfx.group);
     this.ash = new AshField(this.lowSpec ? 700 : 1600);
@@ -1416,6 +1425,43 @@ export class Game {
       desaturate: lowArmor,
       stable: this.reducedMotion || this.pausedForScreenshot,
     });
+    this.verifyOutput();
+  }
+
+  /**
+   * The sky alone makes every legitimate frame bright somewhere. If the drawing
+   * buffer comes back black the GPU rejected part of the post chain, so step
+   * down to a simpler pipeline instead of leaving the player with a void.
+   */
+  private verifyOutput(): void {
+    if (this.renderVerified || this.frame < 4 || this.frame % 10 !== 0 || this.phase === 'failed') return;
+    const gl = this.renderer.getContext();
+    const w = gl.drawingBufferWidth;
+    const h = gl.drawingBufferHeight;
+    // two full-width rows: one through the sky, one through the street
+    if (!this.probe || this.probe.length !== w * 4) this.probe = new Uint8Array(w * 4);
+    let brightest = 0;
+    for (const row of [0.72, 0.3]) {
+      gl.readPixels(0, Math.floor(h * row), w, 1, gl.RGBA, gl.UNSIGNED_BYTE, this.probe);
+      for (let i = 0; i < this.probe.length; i += 16) {
+        brightest = Math.max(brightest, this.probe[i], this.probe[i + 1], this.probe[i + 2]);
+      }
+    }
+    this.lastBrightest = brightest;
+    if (brightest > 24) {
+      this.renderVerified = true;
+      return;
+    }
+    this.blackFrames += 1;
+    if (this.blackFrames < 2) return;
+    this.blackFrames = 0;
+    if (this.pipeline.safeLevel >= 3) {
+      this.renderVerified = true;
+      console.error('[ashen-skyline] The canvas is still black with the plain forward renderer.');
+      return;
+    }
+    this.pipeline.setSafeLevel(this.pipeline.safeLevel + 1);
+    console.warn(`[ashen-skyline] Black frame detected; falling back to render safe level ${this.pipeline.safeLevel}.`);
   }
 
   /** Drop render resolution on GPUs that cannot hold ~40 fps, and recover when there is headroom. */
@@ -1632,6 +1678,9 @@ export class Game {
         postPasses: this.pipeline.postPasses,
         shadowMapSize: this.atmosphere.sun.shadow.mapSize.x,
         shadowLights: 1,
+        safeLevel: this.pipeline.safeLevel,
+        outputVerified: this.renderVerified,
+        brightestSample: this.lastBrightest,
       },
       canvas: {
         clientWidth: this.canvas.clientWidth,
