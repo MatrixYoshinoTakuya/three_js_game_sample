@@ -195,8 +195,6 @@ export class Game {
   private scrapBank = 0;
   private scrapPopup = 0;
   private scrapPopupTimer = 0;
-  private scrapStreak = 0;
-  private scrapStreakTimer = 0;
   private lastKillClock = -10;
   private multiKill = 0;
   private slowHold = 0;
@@ -233,7 +231,6 @@ export class Game {
   private readonly enginePool: EnemyEngineSource[] = [];
   private readonly engineList: EnemyEngineSource[] = [];
   private readonly engineNearest: (Enemy | null)[] = [null, null, null, null];
-  private readonly engineDistance: number[] = [0, 0, 0, 0];
   private readonly targets: HudTargetMarker[] = [];
   private readonly targetPool: HudTargetMarker[] = [];
   private readonly sideObjectives: SideObjective[] = [];
@@ -469,7 +466,6 @@ export class Game {
     this.multiKill = 0;
     this.lastKillClock = -10;
     this.scrapPopup = 0;
-    this.scrapStreak = 0;
     this.hostiles = 0;
     this.aliveEnemies = 0;
     this.driveCombat = false;
@@ -1069,7 +1065,7 @@ export class Game {
     const stepped = this.scoring.chain();
     const points = this.scoring.award(500);
     this.hud.scorePopup('CACHE', points, 'bonus');
-    if (stepped) this.audio.play('combo', { pitch: 0.9 + this.scoring.multiplier * 0.1 });
+    if (stepped) this.audio.play('combo', { pitch: this.scoring.multiplier });
     this.hud.toast(`補給キャッシュ確保 ${opened}/${total}`, 'success');
     this.audio.play('checkpoint');
     this.vfx.flare(cache.x, cache.y + 1.6, cache.z, 0.22, 0.96, 0.85);
@@ -1489,6 +1485,7 @@ export class Game {
     if (this.aimTarget === enemy) this.aimTarget = null;
     if (this.lockTarget === enemy) this.lockTarget = null;
     this.missileSystem.forget(enemy);
+    for (let i = 0; i < 4; i += 1) if (this.engineNearest[i] === enemy) this.engineNearest[i] = null;
   }
 
   private clearEnemies(): void {
@@ -1573,7 +1570,7 @@ export class Game {
       bonus = 100;
     }
     this.hud.scorePopup(label, this.scoring.award(KILL_POINTS[enemy.kind] + bonus), 'kill');
-    if (stepped) this.audio.play('combo', { pitch: 0.9 + this.scoring.multiplier * 0.1 });
+    if (stepped) this.audio.play('combo', { pitch: this.scoring.multiplier });
     // multi-kill: two or more inside a second
     if (this.clock - this.lastKillClock < 1.0) this.multiKill += 1;
     else this.multiKill = 1;
@@ -1630,10 +1627,8 @@ export class Game {
       this.scrapBank += pickup.value;
       this.scrapPopup += this.scoring.award(10 * pickup.value);
       this.scrapPopupTimer = 0.4;
-      // a quick run of pickups climbs in pitch
-      this.scrapStreak = this.scrapStreakTimer > 0 ? Math.min(10, this.scrapStreak + 1) : 0;
-      this.scrapStreakTimer = 0.9;
-      this.audio.play('pickupScrap', { volume: 0.7, pitch: 1 + this.scrapStreak * 0.06 });
+      // the audio system climbs its own pitch ladder on quick repeats
+      this.audio.play('pickupScrap');
       if (this.scrapBank >= SCRAP_PER_FAB) {
         this.scrapBank -= SCRAP_PER_FAB;
         if (this.missiles < this.upgrades.missileMax) {
@@ -1672,7 +1667,6 @@ export class Game {
   /** Per-step bookkeeping for the chain timer, batched scrap popups and lingering fuel fires. */
   private updateScoreFeedback(dt: number, playing: boolean): void {
     if (playing && this.scoring.update(dt)) this.audio.play('comboBreak', { volume: 0.8 });
-    this.scrapStreakTimer -= dt;
     if (this.scrapPopup > 0) {
       this.scrapPopupTimer -= dt;
       if (this.scrapPopupTimer <= 0) {
@@ -1710,7 +1704,7 @@ export class Game {
     const stepped = this.scoring.chain();
     this.hud.scorePopup(label, this.scoring.award(points), 'style');
     this.audio.play(sfx);
-    if (stepped) this.audio.play('combo', { pitch: 0.9 + this.scoring.multiplier * 0.1 });
+    if (stepped) this.audio.play('combo', { pitch: this.scoring.multiplier });
     this.lastStyle = label;
   }
 
@@ -2505,38 +2499,38 @@ export class Game {
     sources.length = 0;
     let pressure = 0;
     if (live) {
-      const nearest = this.engineNearest;
-      const distances = this.engineDistance;
+      // each engine voice keeps its enemy until that enemy dies or drives out of earshot,
+      // so the array order stays stable from frame to frame
+      const slots = this.engineNearest;
       for (let i = 0; i < 4; i += 1) {
-        nearest[i] = null;
-        distances[i] = 170;
+        const held = slots[i];
+        if (held && (!held.alive || Math.hypot(held.vehicle.x - p.x, held.vehicle.z - p.z) > 175)) slots[i] = null;
       }
       for (const enemy of this.enemies) {
         if (!enemy.alive) continue;
         const d = Math.hypot(enemy.vehicle.x - p.x, enemy.vehicle.z - p.z);
         if (enemy.aware) pressure += Math.max(0, 1 - d / 130) * (enemy.kind === 'rig' ? 0.6 : 0.28) + 0.04;
-        // insertion into the four nearest
-        let slot = -1;
+        if (d > 150 || slots[0] === enemy || slots[1] === enemy || slots[2] === enemy || slots[3] === enemy) continue;
         for (let i = 0; i < 4; i += 1) {
-          if (d < distances[i]) {
-            slot = i;
-            break;
-          }
+          if (slots[i]) continue;
+          slots[i] = enemy;
+          break;
         }
-        if (slot < 0) continue;
-        for (let i = 3; i > slot; i -= 1) {
-          nearest[i] = nearest[i - 1];
-          distances[i] = distances[i - 1];
-        }
-        nearest[slot] = enemy;
-        distances[slot] = d;
       }
       this.camera.getWorldDirection(_v2);
       const cam = this.camera.position;
       for (let i = 0; i < 4; i += 1) {
-        const enemy = nearest[i];
-        if (!enemy) break;
+        const enemy = slots[i];
         const source = this.enginePool[i];
+        sources.push(source);
+        if (!enemy) {
+          // empty slot: far beyond earshot, so the voice stays silent without shifting the others
+          source.distance = 9999;
+          source.pan = 0;
+          source.rpm01 = 0;
+          source.heavy = false;
+          continue;
+        }
         const v = enemy.vehicle;
         const dx = v.x - cam.x;
         const dz = v.z - cam.z;
@@ -2544,9 +2538,8 @@ export class Game {
         source.distance = dist;
         // same pan convention as sfxAt: screen-right is (-fz, fx)
         source.pan = Math.max(-0.9, Math.min(0.9, (dx * -_v2.z + dz * _v2.x) / Math.max(1, dist)));
-        source.rpm01 = Math.min(1, 0.18 + v.speed / v.tuning.boostSpeed * 0.8);
+        source.rpm01 = Math.min(1, 0.18 + (v.speed / v.tuning.boostSpeed) * 0.8);
         source.heavy = enemy.kind === 'rig';
-        sources.push(source);
       }
       if (playing) {
         const armor01 = this.armor / this.upgrades.maxArmor;

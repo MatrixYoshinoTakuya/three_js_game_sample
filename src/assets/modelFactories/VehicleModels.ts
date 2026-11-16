@@ -2768,6 +2768,11 @@ export function createWarRig(): VehicleModel {
   return createHeroCar();
 }
 export function createWreckGeometry(_variant: number): THREE.BufferGeometry {
-  void [planarZ, archPts, hazardPanel, glyph, addSkull, finishBody, scrapPaint, sanitizeLog, textureCount, rag, RING_LO, L.hazard];
+  void [colorTris, planarZ, archPts, hazardPanel, glyph, addSkull, finishBody, scrapPaint, sanitizeLog, textureCount, rag, RING_LO, L.hazard];
   return box(1, 1, 1);
+}
+
+/** Build-time safety report: per merged geometry, degenerate triangles dropped and normals repaired. */
+export function vehicleKitDiagnostics(): { geometries: SanitizeEntry[]; textures: number } {
+  return { geometries: sanitizeLog.map((e) => ({ ...e })), textures: textureCount };
 }
