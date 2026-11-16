@@ -666,14 +666,9 @@ export class Game {
   private handleMenuKeys(): void {
     const confirm = this.input.consume('Enter', 'NumpadEnter');
     if (this.input.consume('KeyM')) this.toggleMute();
-    if (this.upgradeOffer && !this.paused) {
-      // keyboard fallback for the upgrade cards
-      const options = this.upgradeOffer.options;
-      if (this.input.consume('Digit1', 'Numpad1') && options[0]) this.resolveUpgrade(options[0].id);
-      else if (this.input.consume('Digit2', 'Numpad2') && options[1]) this.resolveUpgrade(options[1].id);
-      else if (this.input.consume('Digit3', 'Numpad3') && options[2]) this.resolveUpgrade(options[2].id);
-      return;
-    }
+    // while an upgrade choice is open the HUD owns the keyboard (1-3, arrows, Enter) and reports the
+    // pick through onUpgradePick; acting on those keys here as well would apply the pick twice
+    if (this.upgradeOffer) return;
     if (this.input.consume('Escape', 'KeyP')) this.setPaused(!this.paused);
     if (this.phase === 'complete' && this.input.consume('KeyC')) this.continueEndless();
     if (!confirm) return;
@@ -1103,7 +1098,7 @@ export class Game {
     this.audio.play('uiConfirm');
   }
 
-  /** The single path every upgrade choice takes: HUD card click/tap, or the 1-3 keys. */
+  /** The single path every upgrade choice takes (HUD card click/tap/keys). Idempotent: stray or repeated picks are ignored. */
   private resolveUpgrade(id: string): void {
     const offer = this.upgradeOffer;
     if (!offer) return;
@@ -2755,7 +2750,8 @@ export class Game {
     _v.set(x, y, z).applyMatrix4(camera.matrixWorldInverse);
     if (_v.z > -0.6) return;
     _v.applyMatrix4(camera.projectionMatrix);
-    if (Math.abs(_v.x) > 1.15 || Math.abs(_v.y) > 1.15) return;
+    // the HUD does no clamping: only hand it markers that are on screen
+    if (Math.abs(_v.x) > 0.98 || Math.abs(_v.y) > 0.96 || this.targets.length >= 16) return;
     const index = this.targets.length;
     if (index >= this.targetPool.length) this.targetPool.push({ sx: 0, sy: 0, kind, value01: 0, distanceM: 0 });
     const marker = this.targetPool[index];
