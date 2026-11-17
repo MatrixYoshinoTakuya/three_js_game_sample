@@ -20,6 +20,9 @@ import { DRUM_RADIUS, FuelDrums } from './FuelDrums';
 import { PICKUP_COLORS, type Pickup, type PickupKind, PickupSystem } from './Pickups';
 import { DriftTracker, NearMissTracker, type ScoreSnapshot, ScoreSystem, computeRank } from './Scoring';
 import { type UpgradeId, UPGRADE_DEFS, Upgrades } from './Upgrades';
+import { GroundFx } from '../systems/GroundFx';
+import { buildSetDressing } from '../world/SetDressing';
+import type { SetDressing } from './contracts';
 import type { EnemyEngineSource, HudBlip, HudFrame, HudMode, HudTargetMarker, SfxName, SideObjective, UpgradeOption } from './contracts';
 
 type Phase = 'title' | 'drive' | 'event' | 'battle' | 'victory' | 'failed' | 'complete' | 'endless';
@@ -99,6 +102,13 @@ export class Game {
   private readonly pipeline: RenderPipeline;
   private readonly vfx: VfxSystem;
   private readonly ash: AshField;
+  private readonly groundFx: GroundFx;
+  private readonly dressing: SetDressing;
+  private skidLx = 0;
+  private skidLz = 0;
+  private skidRx = 0;
+  private skidRz = 0;
+  private skidActive = false;
   private readonly player: Vehicle;
   private readonly pickups: PickupSystem;
   private readonly drums: FuelDrums;
@@ -263,6 +273,9 @@ export class Game {
 
     // ---- world
     this.layout = generateCity(CITY_SEED);
+    // set dressing first: its solid props (buses, containers, sandbags) must be known to every later placement
+    this.dressing = buildSetDressing(this.layout, this.lowSpec);
+    for (const box of this.dressing.colliders) this.layout.colliders.push(box);
     // supply caches are solid, so their boxes join the static colliders before the grid is built
     const cacheSites = findCacheSites(this.layout, new ColliderGrid(this.layout.colliders), CITY_SEED + 7);
     for (const site of cacheSites) this.layout.colliders.push(site.collider);
@@ -286,6 +299,9 @@ export class Game {
     this.scene.add(this.vfx.group);
     this.ash = new AshField(this.lowSpec ? 700 : 1600);
     this.scene.add(this.ash.points);
+    this.scene.add(this.dressing.group);
+    this.groundFx = new GroundFx(this.lowSpec);
+    this.scene.add(this.groundFx.group);
 
     // ---- gameplay props
     this.pickups = new PickupSystem();
@@ -409,6 +425,8 @@ export class Game {
     this.caches.dispose();
     this.missileSystem.dispose();
     this.ash.dispose();
+    this.groundFx.dispose();
+    this.dressing.dispose();
     this.renderer.dispose();
     window.__THREE_GAME_DIAGNOSTICS__ = undefined;
     window.__THREE_GAME_TEST_HOOKS__ = undefined;
@@ -445,6 +463,8 @@ export class Game {
     this.missileSystem.clear();
     for (const burn of this.burns) burn.life = 0;
     this.vfx.clear();
+    this.groundFx.clear();
+    this.skidActive = false;
     this.cues.length = 0;
     this.hud.clearDialogue();
     this.stage = 'none';
@@ -2321,6 +2341,28 @@ export class Game {
   private updatePlayerFx(dt: number): void {
     const p = this.player;
     const model = p.model;
+    // rubber on the road whenever the rear tyres slide or lock
+    {
+      const sliding = (Math.abs(p.slip) > 4.5 || (p.controls.handbrake && p.speed > 8) || (p.controls.throttle < 0 && p.forwardSpeed > 22)) && p.speed > 5;
+      const fx = Math.sin(p.heading);
+      const fz = Math.cos(p.heading);
+      const rear = model.halfExtents.z * 0.62;
+      const track = model.halfExtents.x * 0.82;
+      const lx = p.x - fx * rear + fz * track;
+      const lz = p.z - fz * rear - fx * track;
+      const rx = p.x - fx * rear - fz * track;
+      const rz = p.z - fz * rear + fx * track;
+      if (sliding && this.skidActive) {
+        const strength = Math.min(1, 0.45 + Math.abs(p.slip) / 14);
+        this.groundFx.skid(this.skidLx, this.skidLz, lx, lz, p.y, strength);
+        this.groundFx.skid(this.skidRx, this.skidRz, rx, rz, p.y, strength);
+      }
+      this.skidActive = sliding;
+      this.skidLx = lx;
+      this.skidLz = lz;
+      this.skidRx = rx;
+      this.skidRz = rz;
+    }
     const braking = p.controls.throttle < 0 && p.forwardSpeed > 1;
     model.tailLightMaterial.emissiveIntensity = braking ? 7 : 1.8;
     model.headlightMaterial.emissiveIntensity = 5;
@@ -2431,6 +2473,17 @@ export class Game {
     this.relay.update(t, this.phase === 'drive' || this.phase === 'title');
     this.atmosphere.update(t, this.phase === 'title' || this.phase === 'event' ? this.player.model.root.position : this.camera.position);
     this.ash.update(t, this.camera.position, this.viewH * this.viewDpr);
+    this.dressing.update(t, this.camera.position, stable ? 0 : delta);
+
+    // contact shadows under every vehicle (the low sun throws real shadows far from the wheels)
+    this.groundFx.beginFrame(this.clock);
+    const pm = this.player.model;
+    this.groundFx.addShadow(this.player.x, this.player.y, this.player.z, this.player.heading, pm.halfExtents.x, pm.halfExtents.z);
+    for (const enemy of this.enemies) {
+      const ev = enemy.vehicle;
+      this.groundFx.addShadow(ev.x, ev.y, ev.z, ev.heading, ev.model.halfExtents.x, ev.model.halfExtents.z);
+    }
+    this.groundFx.endFrame();
 
     // fires: feed particles near the camera and hand the nearest ones a real light
     if (!stable && !this.paused) {
@@ -2798,6 +2851,9 @@ export class Game {
       impact: this.impactFx,
       desaturate: lowArmor,
       stable: this.reducedMotion || this.pausedForScreenshot,
+      // shallow focus for menus and cinematics; gameplay stays pin-sharp
+      dof: this.phase === 'title' ? 9 : this.phase === 'event' ? 5 : this.phase === 'failed' ? 7 : 0,
+      focus: Math.max(4, this.camera.position.distanceTo(this.player.model.root.position)) * (this.phase === 'event' && this.eventTime > 4.6 ? 3 : 1),
     });
     this.verifyOutput();
   }

@@ -203,9 +203,9 @@ export function createNeonMaterial(u: DressUniforms, map: THREE.Texture): THREE.
         float drop = step(0.9 - strike * 2.4, dHash(vec2(tick, seed * 91.0)));
         float flick = buzz * (1.0 - 0.75 * drop);
         // a dead tube section per sign
-        float band = floor(vUv.y * 14.0) + floor(vUv.x * 9.0) * 7.0;
-        float dead = step(0.84, dHash(vec2(band * 0.37, seed * 17.0)));
-        float tube = mask * mask;
+        float band = floor(vUv.y * 9.0);
+        float dead = step(0.9, dHash(vec2(band * 0.37, seed * 17.0)));
+        float tube = smoothstep(0.08, 0.6, mask);
         vec3 lit = vColor * vNeon.z * tube * flick * on * (1.0 - dead * 0.92);
         lit += vec3(1.0) * vNeon.z * 0.22 * tube * tube * flick * on * (1.0 - dead);
         vec3 col = vec3(0.012, 0.012, 0.014) + vec3(0.05, 0.048, 0.045) * mask + lit;
