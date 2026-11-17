@@ -58,8 +58,12 @@ const START_MISSILES = 2;
 const LOCK_CONE = 0.61;
 const LOCK_RANGE = 220;
 const LOCK_TIME = 0.7;
+/** Seconds a lock survives its target slipping out of the cone or behind cover. */
+const LOCK_GRACE = 0.45;
 const DRUM_BLAST_RADIUS = 8;
 const DRUM_DAMAGE = 95;
+/** What one drum does to the player at point-blank (falls off to 30% at the rim). */
+const DRUM_PLAYER_DAMAGE = 13;
 /** Scrap needed for the field fabricator to print a missile (or a patch when the rack is full). */
 const SCRAP_PER_FAB = 40;
 const KILL_POINTS: Record<EnemyKind, number> = { gunner: 150, rammer: 200, rig: 2500 };
@@ -181,6 +185,7 @@ export class Game {
   private lockTarget: Enemy | null = null;
   private lockProgress = 0;
   private lockComplete = false;
+  private lockLost = 0;
   private missileTaught = false;
   // ---- open world
   private readonly streetScrap: { x: number; z: number }[] = [];
@@ -1120,8 +1125,9 @@ export class Game {
     const p = this.player;
     this.vfx.flare(p.x, p.y + 0.6, p.z, 1.0, 0.75, 0.3);
     this.upgradeOffer = null;
+    // a queued choice comes up after a beat, so the HUD closes one screen before opening the next
     const next = this.upgradeQueue.shift();
-    if (next) this.offerUpgrade(next.title, next.subtitle);
+    if (next) this.cue(0.6, () => this.offerUpgrade(next.title, next.subtitle));
   }
 
   // ================================================================ endless
@@ -1145,8 +1151,13 @@ export class Game {
 
   private startEndless(fromRetry: boolean): void {
     if (fromRetry && this.endlessStart) {
+      // score and scrap go back to where the bounty hunt began; upgrades earned since then are kept
+      const levels = this.upgrades.snapshot();
       this.resetRunState();
       this.restore(this.endlessStart);
+      this.upgrades.restore(levels);
+      this.armor = this.upgrades.maxArmor;
+      this.missiles = Math.min(this.upgrades.missileMax, Math.max(this.missiles, START_MISSILES));
       this.drums.reset();
       this.player.place(this.layout.relay.x + 3, this.layout.relay.z - 52, 0);
       this.turretYaw = 0;
@@ -1462,8 +1473,10 @@ export class Game {
 
   // ================================================================ enemies
 
-  private spawnEnemy(kind: EnemyKind, variant: number, x: number, z: number, heading: number, flank: number, healthScale = this.upgrades.enemyHealthScale): Enemy {
-    const enemy = new Enemy(kind, variant, flank, this.rng() * 1.5, healthScale);
+  private spawnEnemy(kind: EnemyKind, variant: number, x: number, z: number, heading: number, flank: number, healthScale = -1): Enemy {
+    // raiders toughen up a little as the player's build grows; the war rig's story fight stays as tuned
+    const scale = healthScale > 0 ? healthScale : kind === 'rig' ? 1 : this.upgrades.enemyHealthScale;
+    const enemy = new Enemy(kind, variant, flank, this.rng() * 1.5, scale);
     enemy.vehicle.place(x, z, heading);
     this.scene.add(enemy.vehicle.model.root);
     this.enemies.push(enemy);
@@ -1494,8 +1507,13 @@ export class Game {
 
   private damageEnemy(enemy: Enemy, amount: number, cause: DamageCause = 'other', range = 0): void {
     if (!enemy.alive) return;
-    enemy.lastHit = cause;
-    enemy.lastHitRange = range;
+    // a cannon round that finishes off someone still reeling from a blast keeps the blast's credit
+    const reeling = cause === 'cannon' && (enemy.lastHit === 'barrel' || enemy.lastHit === 'missile') && this.clock - enemy.lastHitAt < 1.2;
+    if (!reeling) {
+      enemy.lastHit = cause;
+      enemy.lastHitRange = range;
+      enemy.lastHitAt = this.clock;
+    }
     // getting shot is a fairly clear hint that someone is out there
     if (!enemy.aware) this.onEnemyAlerted(enemy);
     enemy.health -= amount;
@@ -1858,8 +1876,14 @@ export class Game {
     let target: Enemy | null = null;
     if (this.playing() && this.missiles > 0) {
       const current = this.lockTarget;
-      if (current && current.alive && this.lockable(current, LOCK_CONE * 1.25)) target = current;
-      else {
+      if (current && current.alive && this.lockable(current, LOCK_CONE * (this.lockComplete ? 1.7 : 1.3))) {
+        target = current;
+        this.lockLost = 0;
+      } else if (current && current.alive && this.lockLost < LOCK_GRACE) {
+        // a lamp post, a wreck or a twitch of the wheel should not throw the lock away
+        this.lockLost += dt;
+        return;
+      } else {
         let bestScore = 1e9;
         for (const enemy of this.enemies) {
           if (!enemy.alive || !this.lockable(enemy, LOCK_CONE)) continue;
@@ -1877,6 +1901,7 @@ export class Game {
       this.lockTarget = target;
       this.lockProgress = 0;
       this.lockComplete = false;
+      this.lockLost = 0;
     }
     if (!target) return;
     if (this.lockComplete) return;
@@ -1897,7 +1922,7 @@ export class Game {
     const dx = enemy.vehicle.x - p.x;
     const dz = enemy.vehicle.z - p.z;
     const dist = Math.hypot(dx, dz);
-    if (dist > LOCK_RANGE || dist < 6) return false;
+    if (dist > LOCK_RANGE || dist < 3.5) return false;
     if (!enemy.aware && dist > 130) return false;
     if (Math.abs(wrapAngle(Math.atan2(dx, dz) - p.heading)) > cone) return false;
     return this.grid.lineOfSight(p.x, p.z, enemy.vehicle.x, enemy.vehicle.z);
@@ -2013,7 +2038,7 @@ export class Game {
       break;
     }
     // enemies take the full blast; the player's armour soaks most of it
-    this.blast(x, z, DRUM_BLAST_RADIUS, DRUM_DAMAGE, 'barrel', this.playing() ? 20 : 0, null);
+    this.blast(x, z, DRUM_BLAST_RADIUS, DRUM_DAMAGE, 'barrel', this.playing() ? DRUM_PLAYER_DAMAGE : 0, null);
   }
 
   private spawnProjectile(x: number, y: number, z: number, dx: number, dy: number, dz: number, speed: number, damage: number, player: boolean): void {
@@ -2936,7 +2961,7 @@ export class Game {
       this.damageTaken = 100;
       this.failRun();
       this.simulate(3.2, 0, 0, false);
-    } else if (name === 'complete' || name === 'endless') {
+    } else if (name === 'complete' || name === 'endless' || name === 'endless-rig') {
       this.startRun();
       this.cues.length = 0;
       this.relayPower = 1;
@@ -2952,10 +2977,11 @@ export class Game {
       this.phase = 'complete';
       this.setObjective('任務完了', '第7中継塔 確保');
       this.simulate(0.5, 0, 0, false);
-      if (name === 'endless') {
+      if (name !== 'complete') {
         // the path the HUD's "フリーローム続行" button takes, then run until the first bounty wave is in
         this.continueEndless();
         this.cues.length = 0;
+        if (name === 'endless-rig') this.endlessWave = 3;
         this.simulate(5.4, 0, 0, false);
       }
     } else if (name === 'pickups') {
@@ -2980,16 +3006,24 @@ export class Game {
       b.squad = 50;
       this.simulate(0.4, 0, 0, false);
     } else if (name === 'missile') {
-      // a raider dead ahead: the lock is complete and one missile is already on its way
-      this.startQuietRun(this.clearLane(relay.x - CITY.pitch / 2, relay.z - 150, 150), relay.z - 150, 0);
-      this.player.vz = 24;
-      const target = this.spawnEnemy('gunner', 0, this.player.x - 2, this.player.z + 75, 0, 1, 1);
-      target.vehicle.vz = 22;
+      // a raider dead ahead on the street south of the relay: locked, one missile already on its way
+      const roadZ = relay.z - CITY.pitch / 2;
+      let laneZ = roadZ - 5.5;
+      for (const lane of [-5.5, 5.5, -9.5, 9.5, -2.5, 2.5]) {
+        if (this.grid.raycast(relay.x - 150, roadZ + lane, relay.x - 20, roadZ + lane) >= 1) {
+          laneZ = roadZ + lane;
+          break;
+        }
+      }
+      this.startQuietRun(relay.x - 150, laneZ, Math.PI / 2);
+      this.player.vx = 24;
+      const target = this.spawnEnemy('gunner', 0, this.player.x + 62, laneZ + 1.5, Math.PI / 2, 1, 1);
+      target.vehicle.vx = 22;
       target.holdFire(30);
       this.missiles = 4;
       this.simulate(1.0, 0.7, 0, false);
       this.fireMissile();
-      this.simulate(0.22, 0.7, 0, false);
+      this.simulate(0.13, 0.7, 0, false);
     } else if (name === 'cache' || name === 'cache-clear') {
       // on the approach line of the first supply cache; guards parked (or already dealt with)
       const cache = this.caches.caches[0];
@@ -3133,6 +3167,7 @@ export class Game {
         x: enemy.vehicle.x, z: enemy.vehicle.z, kind: enemy.kind, health: enemy.health / enemy.maxHealth,
         aware: enemy.aware, mode: enemy.mode, squad: enemy.squad,
       })),
+      mortars: this.mortars.filter((m) => m.active).map((m) => ({ x: m.x, z: m.z, timer: m.timer })),
       points: this.scoring.score,
       combo: { count: this.scoring.comboCount, multiplier: this.scoring.multiplier, timer01: this.scoring.timer01, best: this.scoring.bestCombo },
       scrap: this.scoring.scrap,

@@ -203,8 +203,8 @@ export function createNeonMaterial(u: DressUniforms, map: THREE.Texture): THREE.
         float drop = step(0.9 - strike * 2.4, dHash(vec2(tick, seed * 91.0)));
         float flick = buzz * (1.0 - 0.75 * drop);
         // a dead tube section per sign
-        float band = floor(vUv.y * 61.0 + vUv.x * 23.0);
-        float dead = step(0.86, dHash(vec2(band * 0.37, seed * 17.0)));
+        float band = floor(vUv.y * 14.0) + floor(vUv.x * 9.0) * 7.0;
+        float dead = step(0.84, dHash(vec2(band * 0.37, seed * 17.0)));
         float tube = mask * mask;
         vec3 lit = vColor * vNeon.z * tube * flick * on * (1.0 - dead * 0.92);
         lit += vec3(1.0) * vNeon.z * 0.22 * tube * tube * flick * on * (1.0 - dead);
@@ -264,8 +264,7 @@ export function createFxMaterial(u: DressUniforms, noise: THREE.Texture): THREE.
           else if (aAnim.w < -1.5) { float s = max(sin(uTime * 4.2 + ph), 0.0); gate = s * s * s * s * s * s; }
           else if (aAnim.w < -0.5) gate = 0.03 + 0.97 * smoothstep(-0.15, 0.15, sin(uTime * 3.3 + ph));
           else if (aAnim.w > 0.0001) gate = smoothstep(aAnim.w, aAnim.w + 0.06, uPower);
-          gate *= 1.0 - aAnim.y * (0.5 + 0.5 * sin(uTime * 19.0 + ph * 3.0)) * 0.35;
-          fade = 1.0;
+          gate *= 1.0 - min(aAnim.y, 1.0) * (0.5 + 0.5 * sin(uTime * 19.0 + ph * 3.0)) * 0.35;
         }
         vUv = vec2(aCorner.x, aCorner.y);
         vTint = vec4(aTint.rgb, aTint.a * fade * gate);
@@ -311,7 +310,8 @@ export function createFxMaterial(u: DressUniforms, noise: THREE.Texture): THREE.
           vec2 q = vec2(vUv.x * 0.5 * scale + seed, vUv.y * scale * 1.6 - uTime * 0.035);
           float n1 = texture2D(tNoise, q).r;
           float n2 = texture2D(tNoise, q * 2.7 + vec2(seed, -uTime * 0.03)).g;
-          float n = n1 * 0.68 + n2 * 0.32;
+          float n3 = texture2D(tNoise, q * 6.1 + vec2(-seed, -uTime * 0.05)).r;
+          float n = n1 * 0.6 + n2 * 0.28 + n3 * 0.12;
           float edge = 1.0 - abs(vUv.x);
           float body = smoothstep(0.02, 0.72, edge + (n - 0.5) * 1.1);
           float vfade = smoothstep(0.0, 0.07, vUv.y) * (1.0 - smoothstep(0.5, 1.0, vUv.y + (n - 0.5) * 0.45));
@@ -399,17 +399,17 @@ export function createPaperMaterial(u: DressUniforms): THREE.ShaderMaterial {
         vec2 rel = mod(p0 - cameraPosition.xz + box * 0.5, box) - box * 0.5;
         float hop = abs(sin(uTime * (0.45 + aSeed.w * 0.8) + aSeed.x * 40.0));
         float gust = 0.5 + 0.5 * sin(uTime * 0.23 + aSeed.z * 20.0);
-        vec3 centre = vec3(cameraPosition.x + rel.x, 0.1 + hop * hop * (0.25 + aSeed.y * 2.4) * gust, cameraPosition.z + rel.y);
+        vec3 centre = vec3(cameraPosition.x + rel.x, 0.08 + hop * hop * hop * (0.15 + aSeed.y * 1.7) * gust, cameraPosition.z + rel.y);
         float edgeFade = 1.0 - smoothstep(34.0, 47.0, max(abs(rel.x), abs(rel.y)));
         float ang = uTime * (0.8 + aSeed.w * 3.2) * (0.25 + hop) + aSeed.y * 30.0;
         float tilt = ang * 0.7 + aSeed.z * 9.0;
         vec3 ax = vec3(cos(ang), 0.0, sin(ang));
         vec3 ay = vec3(-sin(ang) * sin(tilt), cos(tilt), cos(ang) * sin(tilt));
         float size = (0.7 + aSeed.y * 0.9) * edgeFade;
-        vec3 world = centre + (ax * position.x * 0.2 + ay * position.y * 0.14) * size;
+        vec3 world = centre + (ax * position.x * 0.15 + ay * position.y * 0.105) * size;
         vec3 n = cross(ax, ay);
         float tone = 0.5 + 0.5 * aSeed.z;
-        vCol = mix(vec3(0.34, 0.31, 0.26), vec3(0.2, 0.15, 0.1), step(0.75, aSeed.w)) * tone * (0.35 + 0.9 * abs(dot(n, uSunDir)));
+        vCol = mix(vec3(0.2, 0.185, 0.16), vec3(0.11, 0.085, 0.06), step(0.6, aSeed.w)) * tone * (0.4 + 0.8 * abs(dot(n, uSunDir)));
         gl_Position = projectionMatrix * viewMatrix * vec4(world, 1.0);
       }`,
     fragmentShader: /* glsl */ `

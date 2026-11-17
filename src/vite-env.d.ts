@@ -20,6 +20,8 @@ interface ThreeGameDiagnostics {
   /** Cumulative damage by source for the whole session (balance telemetry). */
   damageBy: { shot: number; ram: number; mortar: number; wall: number; blast: number };
   enemies: { x: number; z: number; kind: string; health: number; aware: boolean; mode: string; squad: number }[];
+  /** Mortar shells in the air: impact point and seconds to impact. */
+  mortars: { x: number; z: number; timer: number }[];
   /** Session score in points (`score` above stays the kill count for the generic inspector). */
   points: number;
   combo: { count: number; multiplier: number; timer01: number; best: number };

@@ -65,8 +65,11 @@ function scorch(s: Soup, from: number, amount: number, burnZ: number | null = nu
 }
 
 function wheel(s: Soup, x: number, y: number, z: number, r: number, w: number): void {
-  s.cyl(x, y, z, r, r, w, 10, PAL.rubber, 'x');
-  s.cyl(x + Math.sign(x) * (w * 0.5 + 0.005), y, z, r * 0.5, r * 0.5, 0.02, 8, PAL.rust, 'x');
+  s.cyl(x, y, z, r, r, w, 8, PAL.rubber, 'x');
+  const hub = new THREE.CircleGeometry(r * 0.5, 6);
+  hub.rotateY(Math.sign(x) >= 0 ? Math.PI / 2 : -Math.PI / 2);
+  hub.translate(x + Math.sign(x) * (w * 0.5 + 0.006), y, z);
+  s.geo(hub, null, PAL.rust);
 }
 
 // ------------------------------------------------------------------ bus
@@ -285,16 +288,15 @@ export function buildContainer(len: number, paint: Rgb, seed: number): Soup {
     s.transform(start, m);
   };
   const side = new THREE.Matrix4();
-  wall(len - 0.2, Math.round(len / 0.55), side.makeRotationY(Math.PI / 2).setPosition(W / 2 - 0.03, 0, 0));
-  wall(len - 0.2, Math.round(len / 0.55), side.makeRotationY(-Math.PI / 2).setPosition(-W / 2 + 0.03, 0, 0));
-  wall(W - 0.2, 5, side.makeRotationY(Math.PI).setPosition(0, 0, -len / 2 + 0.03));
+  wall(len - 0.2, Math.round(len / 0.8), side.makeRotationY(Math.PI / 2).setPosition(W / 2 - 0.03, 0, 0));
+  wall(len - 0.2, Math.round(len / 0.8), side.makeRotationY(-Math.PI / 2).setPosition(-W / 2 + 0.03, 0, 0));
+  wall(W - 0.2, 4, side.makeRotationY(Math.PI).setPosition(0, 0, -len / 2 + 0.03));
   // roof
   s.quad([-W / 2, H - 0.03, len / 2], [W / 2, H - 0.03, len / 2], [W / 2, H - 0.03, -len / 2], [-W / 2, H - 0.03, -len / 2], [0, 0, 1, 1], mul(paint, 0.7));
   // doors
   for (const sx of [-1, 1]) {
     s.box(sx * 0.58, H / 2, len / 2 - 0.05, 1.1, H - 0.3, 0.05, mul(paint, 0.92));
     for (const rx of [0.25, 0.85]) s.beam(sx * rx, 0.14, len / 2, sx * rx, H - 0.14, len / 2, 0.045, PAL.galv);
-    s.box(sx * 0.5, 1.15, len / 2 + 0.03, 0.34, 0.05, 0.03, PAL.galv);
   }
   // frame
   const frame = mul(paint, 0.72);
@@ -303,18 +305,23 @@ export function buildContainer(len: number, paint: Rgb, seed: number): Soup {
     s.box(sx * (W / 2 - 0.06), H - 0.07, 0, 0.13, 0.14, len - 0.3, frame);
     s.box(sx * (W / 2 - 0.06), 0.08, 0, 0.13, 0.16, len - 0.3, frame);
   }
-  for (const sz of [-1, 1]) s.box(0, H - 0.07, sz * (len / 2 - 0.06), W - 0.3, 0.14, 0.13, frame);
   // stencil block
-  for (const sx of [-1, 1]) s.box(sx * (W / 2 + 0.005), H * 0.66, len * 0.18, 0.02, 0.5, Math.min(2.4, len * 0.3), mix(paint, PAL.white, 0.7));
+  for (const sx of [-1, 1]) {
+    const zl = Math.min(2.4, len * 0.3) / 2;
+    const x = sx * (W / 2 + 0.004);
+    s.quad([x, H * 0.56, len * 0.18 + sx * zl], [x, H * 0.56, len * 0.18 - sx * zl], [x, H * 0.76, len * 0.18 - sx * zl], [x, H * 0.76, len * 0.18 + sx * zl], [0, 0, 1, 1], mix(paint, PAL.white, 0.7));
+  }
   scorch(s, from, 0.22 + rng() * 0.3);
   return s;
 }
 
 // ------------------------------------------------------------------ dead trees
 
-export function buildTree(variant: number, seed: number): { wood: Soup; cards: Soup } {
+export function buildTree(variant: number, seed: number): { wood: Soup; fine: Soup; cards: Soup } {
   const rng = createSeededRandom(seed);
-  const wood = new Soup();
+  const trunk = new Soup();
+  const fine = new Soup();
+  let wood = trunk;
   const cards = new Soup();
   const maxDepth = variant === 1 ? 1 : 2;
   const height = [10.5, 6.5, 8.5][variant];
@@ -362,8 +369,11 @@ export function buildTree(variant: number, seed: number): { wood: Soup; cards: S
     }
   };
   const branch = (start: THREE.Vector3, dir: THREE.Vector3, len: number, r0: number, depth: number) => {
-    const segs = depth === 0 ? 4 : depth === 1 ? 3 : 2;
+    const segs = depth === 0 ? 3 : depth === 1 ? 3 : 1;
     const sides = depth === 0 ? 5 : depth === 1 ? 4 : 3;
+    const outer = wood;
+    // twigs are too thin to resolve in the shadow map: they go to the non-casting layer
+    wood = depth >= 2 ? fine : trunk;
     const cur = start.clone();
     const d = dir.clone();
     if (d.lengthSq() < 1e-6) d.set(0, 1, 0);
@@ -378,12 +388,12 @@ export function buildTree(variant: number, seed: number): { wood: Soup; cards: S
       if (d.lengthSq() < 1e-6) d.set(0, 1, 0);
       d.normalize();
       cur.addScaledVector(d, len / segs);
-      const tipTaper = depth === maxDepth ? 0.9 : 0.42;
+      const tipTaper = depth === maxDepth ? 0.94 : 0.42;
       const radius = Math.max(0.018, r0 * (1 - t * tipTaper));
       const next = ring(cur, d, radius, sides, depth);
       connect(prev, next, sides);
       prev = next;
-      if (depth < maxDepth && i >= (depth === 0 ? segs - 1 : 1)) {
+      if (depth < maxDepth && i >= (depth === 0 ? segs - 1 : 2)) {
         const kids = depth === 0 ? (i === segs ? 3 : 1 + (variant === 2 ? 1 : 0)) : 1 + (rng() < 0.4 ? 1 : 0);
         const baseAz = rng() * Math.PI * 2;
         for (let k = 0; k < kids; k += 1) {
@@ -393,27 +403,31 @@ export function buildTree(variant: number, seed: number): { wood: Soup; cards: S
           // tilt the child cone toward the parent direction
           child.addScaledVector(d, 0.7).normalize();
           branch(cur, child, len * (0.55 + rng() * 0.25), radius * 0.62, depth + 1);
+          wood = depth >= 2 ? fine : trunk;
         }
       }
     }
-    if (depth === maxDepth || (variant === 1 && depth === 1)) twigs(cur, d, 1.5 + rng() * 1.1);
+    if (depth === maxDepth || (variant === 1 && depth === 1)) twigs(cur, d, 1.2 + rng() * 0.9);
     if (depth === 0 && variant === 1) {
       // splintered break
       for (let k = 0; k < 4; k += 1) {
         const a = rng() * 6.28;
-        wood.beam(cur.x + Math.cos(a) * 0.08, cur.y - 0.1, cur.z + Math.sin(a) * 0.08, cur.x + Math.cos(a) * 0.2, cur.y + 0.4 + rng() * 0.7, cur.z + Math.sin(a) * 0.2, 0.07, mul(PAL.bark, 1.5), 3);
+        fine.beam(cur.x + Math.cos(a) * 0.08, cur.y - 0.1, cur.z + Math.sin(a) * 0.08, cur.x + Math.cos(a) * 0.2, cur.y + 0.4 + rng() * 0.7, cur.z + Math.sin(a) * 0.2, 0.07, mul(PAL.bark, 1.5), 3);
       }
     }
+    wood = outer;
   };
   const lean = variant === 2 ? new THREE.Vector3(0.32, 1, 0.12) : new THREE.Vector3((rng() - 0.5) * 0.1, 1, (rng() - 0.5) * 0.1);
   branch(new THREE.Vector3(0, -0.15, 0), lean, [4.4, 5.2, 3.0][variant], [0.2, 0.25, 0.24][variant], 0);
   // root flare and broken paving collar
-  wood.cyl(0, 0.12, 0, 0.24, 0.42, 0.3, 6, mul(PAL.bark, 0.9));
-  for (let k = 0; k < 4; k += 1) {
-    const a = (k / 4) * Math.PI * 2 + 0.4;
+  wood = trunk;
+  wood.cyl(0, 0.12, 0, 0.24, 0.42, 0.3, 5, mul(PAL.bark, 0.9), 'y', true);
+  wood = fine;
+  for (let k = 0; k < 1; k += 1) {
+    const a = 0.4 + rng() * 3;
     wood.box(Math.cos(a) * 0.78, 0.04, Math.sin(a) * 0.78, 1.0, 0.1, 0.16, mul(PAL.concrete, 0.8), -a + Math.PI / 2, 0, (rng() - 0.5) * 0.2);
   }
-  return { wood, cards };
+  return { wood: trunk, fine, cards };
 }
 
 // ------------------------------------------------------------------ street furniture
@@ -426,16 +440,16 @@ export function buildTree(variant: number, seed: number): { wood: Soup; cards: S
 export function buildTrafficLight(variant: number): Soup {
   const s = new Soup();
   const metal = PAL.steel;
-  s.cyl(0, 0.3, 0, 0.2, 0.26, 0.6, 6, metal);
-  s.cyl(0, 3.6, 0, 0.1, 0.14, 6.6, 6, metal, 'y', true);
+  s.box(0, 0.25, 0, 0.42, 0.5, 0.42, metal);
+  s.cyl(0, 3.6, 0, 0.1, 0.14, 6.6, 5, metal, 'y', true);
   const head = (x: number, y: number, z: number, rz: number, ry: number) => {
     const part = new Soup();
     part.box(0, 0, 0, 1.3, 0.44, 0.28, PAL.soot);
-    part.box(0, 0.26, 0.18, 1.34, 0.03, 0.36, PAL.soot);
+    part.quad([-0.67, 0.25, -0.1], [-0.67, 0.25, 0.38], [0.67, 0.25, 0.38], [0.67, 0.25, -0.1], [0, 0, 1, 1], PAL.soot);
     const lamps: Rgb[] = [[0.04, 0.09, 0.07], PAL.amber, [0.11, 0.02, 0.015]];
     lamps.forEach((col, n) => {
       const lit = n === 1 && variant === 1;
-      const disc = new THREE.CircleGeometry(0.15, 8);
+      const disc = new THREE.CircleGeometry(0.15, 6);
       disc.translate(-0.42 + n * 0.42, 0, 0.145);
       part.geo(disc, null, lit ? col : n === 1 ? [0.12, 0.07, 0.015] : col, lit ? [0, 7, 1] : [0, 0, 0]);
     });
@@ -458,10 +472,10 @@ export function buildTrafficLight(variant: number): Soup {
   }
   // pedestrian signal on the pole
   s.box(0.24, 2.9, 0.05, 0.26, 0.6, 0.3, PAL.soot);
-  s.box(0.38, 3.05, 0.05, 0.02, 0.2, 0.2, [0.1, 0.02, 0.015]);
-  s.box(0.38, 2.78, 0.05, 0.02, 0.2, 0.2, [0.03, 0.08, 0.06]);
+  s.quad([0.372, 2.95, 0.15], [0.372, 2.95, -0.05], [0.372, 3.15, -0.05], [0.372, 3.15, 0.15], [0, 0, 1, 1], [0.1, 0.02, 0.015]);
+  s.quad([0.372, 2.68, 0.15], [0.372, 2.68, -0.05], [0.372, 2.88, -0.05], [0.372, 2.88, 0.15], [0, 0, 1, 1], [0.03, 0.08, 0.06]);
   // control cabinet
-  s.box(-0.5, 0.75, 0.1, 0.5, 1.3, 0.4, PAL.galv);
+  if (variant !== 2) s.box(-0.5, 0.75, 0.1, 0.5, 1.3, 0.4, PAL.galv);
   return s;
 }
 
@@ -477,7 +491,7 @@ export function buildGantry(damaged: boolean, panels: readonly number[]): Kit {
   }
   const sag = damaged ? 0.5 : 0.08;
   const yAt = (x: number, base: number) => base - sag * (1 - (x / 15) * (x / 15));
-  const steps = 10;
+  const steps = 6;
   for (let n = 0; n < steps; n += 1) {
     const x0 = -15 + (30 / steps) * n;
     const x1 = x0 + 30 / steps;
@@ -574,8 +588,9 @@ export function buildSandbagWall(length: number, rows: number, seed: number): So
     for (let n = 0; n < count; n += 1) {
       if (r === rows - 1 && rng() < 0.18) continue;
       const tone = 0.75 + rng() * 0.45;
-      const g = new THREE.SphereGeometry(1, 5, 3);
-      g.scale(bagLen * 0.56, 0.155, 0.24);
+      const g = new THREE.SphereGeometry(1, 4, 3);
+      g.rotateY(Math.PI / 4);
+      g.scale(bagLen * 0.66, 0.16, 0.3);
       g.rotateY((rng() - 0.5) * 0.3);
       g.translate(-length / 2 + bagLen / 2 + offset + n * bagLen, 0.13 + r * 0.235, (rng() - 0.5) * 0.08);
       s.geo(g, null, mul(PAL.sand, tone));
@@ -613,7 +628,7 @@ export function buildTyreStack(count: number, seed: number): Soup {
     x += (rng() - 0.5) * 0.09;
     z += (rng() - 0.5) * 0.09;
     const y = 0.13 + n * 0.25;
-    s.cyl(x, y, z, 0.42, 0.42, 0.25, 9, mul(PAL.rubber, 0.8 + rng() * 0.8), 'y', n < count - 1);
+    s.cyl(x, y, z, 0.42, 0.42, 0.25, 8, mul(PAL.rubber, 0.8 + rng() * 0.8), 'y', n < count - 1);
     if (n === count - 1) s.cyl(x, y + 0.126, z, 0.24, 0.24, 0.004, 8, [0.004, 0.004, 0.004]);
   }
   return s;
@@ -622,7 +637,7 @@ export function buildTyreStack(count: number, seed: number): Soup {
 export function buildPallet(): Soup {
   const s = new Soup();
   for (const z of [-0.45, 0, 0.45]) s.box(0, 0.06, z, 1.2, 0.1, 0.1, PAL.woodDark);
-  for (let n = 0; n < 5; n += 1) s.box(-0.5 + n * 0.25, 0.135, 0, 0.16, 0.035, 1.0, mul(PAL.wood, 0.8 + (n % 3) * 0.15));
+  for (let n = 0; n < 3; n += 1) s.box(-0.42 + n * 0.42, 0.135, 0, 0.3, 0.035, 1.0, mul(PAL.wood, 0.8 + (n % 3) * 0.15));
   return s;
 }
 
@@ -657,7 +672,7 @@ export function buildAcUnit(): Soup {
   const fan = new THREE.CircleGeometry(0.36, 10);
   fan.translate(0, 0.52, 0.38);
   s.geo(fan, null, PAL.char);
-  for (let n = 0; n < 5; n += 1) s.box(-0.56, 0.2 + n * 0.15, 0.378, 0.12, 0.05, 0.01, PAL.char);
+  s.quad([-0.62, 0.15, 0.378], [-0.5, 0.15, 0.378], [-0.5, 0.85, 0.378], [-0.62, 0.85, 0.378], [0, 0, 1, 1], PAL.char);
   s.box(0.3, 1.02, 0, 0.5, 0.05, 0.6, PAL.soot);
   s.beam(0.66, 0.3, -0.2, 1.1, 0.05, -0.5, 0.05, [0.3, 0.16, 0.08]);
   return s;
@@ -665,9 +680,7 @@ export function buildAcUnit(): Soup {
 
 export function buildRock(seed: number): Soup {
   const rng = createSeededRandom(seed);
-  const source = new THREE.DodecahedronGeometry(1, 0);
-  const g = source.toNonIndexed();
-  source.dispose();
+  const g = new THREE.DodecahedronGeometry(1, 0);
   const position = g.getAttribute('position') as THREE.BufferAttribute;
   const cache = new Map<string, [number, number, number]>();
   for (let i = 0; i < position.count; i += 1) {
@@ -681,6 +694,25 @@ export function buildRock(seed: number): Soup {
   }
   g.computeVertexNormals();
   return new Soup().geo(g, null, [0.27, 0.255, 0.235]);
+}
+
+/** Eight-triangle masonry chip for spill aprons. */
+export function buildChip(seed: number): Soup {
+  const rng = createSeededRandom(seed);
+  const source = new THREE.OctahedronGeometry(1, 0);
+  const position = source.getAttribute('position') as THREE.BufferAttribute;
+  const cache = new Map<string, [number, number, number]>();
+  for (let i = 0; i < position.count; i += 1) {
+    const key = `${position.getX(i).toFixed(2)},${position.getY(i).toFixed(2)},${position.getZ(i).toFixed(2)}`;
+    let j = cache.get(key);
+    if (!j) {
+      j = [(rng() - 0.5) * 0.7, (rng() - 0.5) * 0.3, (rng() - 0.5) * 0.7];
+      cache.set(key, j);
+    }
+    position.setXYZ(i, position.getX(i) + j[0], position.getY(i) * 0.55 + j[1], position.getZ(i) + j[2]);
+  }
+  source.computeVertexNormals();
+  return new Soup().geo(source, null, [0.27, 0.255, 0.235]);
 }
 
 /** A-frame barricade with a striped board and an amber beacon. */
@@ -792,7 +824,7 @@ export function buildScaffold(length: number, levels: number, seed: number, tarp
     topOf.push(top);
     const x = x0 + b * bay;
     for (const z of [0.25, 0.25 + depth]) {
-      s.beam(x, 0, z, x + (rng() - 0.5) * 0.06, top * lift + 0.9, z, 0.06, tube);
+      s.beam(x, 0, z, x + (rng() - 0.5) * 0.06, top * lift + 0.9, z, 0.09, tube, 3);
     }
     s.box(x, 0.03, 0.25 + depth, 0.22, 0.05, 0.22, PAL.wood);
   }
@@ -802,15 +834,15 @@ export function buildScaffold(length: number, levels: number, seed: number, tarp
       if (Math.min(topOf[b], topOf[b + 1]) < l) continue;
       const xa = x0 + b * bay;
       const xb = xa + bay;
-      s.beam(xa, y, 0.25 + depth, xb, y, 0.25 + depth, 0.05, tube);
-      s.beam(xa, y + 1.0, 0.25 + depth, xb, y + 1.0, 0.25 + depth, 0.04, tube);
-      s.beam(xa, y, 0.25, xa, y, 0.25 + depth, 0.05, tube);
+      s.beam(xa, y, 0.25 + depth, xb, y, 0.25 + depth, 0.08, tube, 3);
+      s.beam(xa, y + 1.0, 0.25 + depth, xb, y + 1.0, 0.25 + depth, 0.07, tube, 3);
+      s.beam(xa, y, 0.25, xa, y, 0.25 + depth, 0.08, tube, 3);
       const missing = rng() < 0.18;
       if (!missing) {
         const droop = rng() < 0.12 ? -0.5 : 0;
         s.box(xa + bay / 2, y + 0.05 + droop * 0.5, 0.25 + depth / 2, bay - 0.05, 0.05, depth - 0.1, mul(PAL.wood, 0.75 + rng() * 0.4), 0, 0, droop * 0.4);
       }
-      if ((b + l) % 3 === 0) s.beam(xa, y - lift, 0.25 + depth, xb, y, 0.25 + depth, 0.04, tube);
+      if ((b + l) % 3 === 0) s.beam(xa, y - lift, 0.25 + depth, xb, y, 0.25 + depth, 0.07, tube, 3);
       // torn sheeting
       if (rng() < 0.4) {
         const rect = CARD.tarp[rng() < 0.5 ? 0 : 1];
@@ -825,12 +857,12 @@ export function buildScaffold(length: number, levels: number, seed: number, tarp
     }
   }
   // ladder
-  s.beam(x0 + 0.4, 0, 0.25 + depth + 0.5, x0 + 0.4, lift + 0.6, 0.25 + depth, 0.04, tube);
-  s.beam(x0 + 0.8, 0, 0.25 + depth + 0.5, x0 + 0.8, lift + 0.6, 0.25 + depth, 0.04, tube);
+  s.beam(x0 + 0.4, 0, 0.25 + depth + 0.5, x0 + 0.4, lift + 0.6, 0.25 + depth, 0.07, tube, 3);
+  s.beam(x0 + 0.8, 0, 0.25 + depth + 0.5, x0 + 0.8, lift + 0.6, 0.25 + depth, 0.07, tube, 3);
   // fallen tubes and planks at the foot
   for (let n = 0; n < 3; n += 1) {
     const fx = x0 + rng() * bays * bay;
-    s.beam(fx, 0.05, 2.0 + rng(), fx + 2.2 + rng() * 1.5, 0.05 + rng() * 0.3, 2.2 + rng() * 1.2, 0.06, tube);
+    s.beam(fx, 0.05, 2.0 + rng(), fx + 2.2 + rng() * 1.5, 0.05 + rng() * 0.3, 2.2 + rng() * 1.2, 0.09, tube, 3);
   }
   return kit;
 }

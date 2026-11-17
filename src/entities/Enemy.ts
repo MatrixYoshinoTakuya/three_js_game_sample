@@ -65,6 +65,8 @@ export class Enemy {
   /** What landed the most recent damage (kill attribution for style bonuses). */
   lastHit: 'cannon' | 'missile' | 'ram' | 'barrel' | 'mortar' | 'other' = 'other';
   lastHitRange = 0;
+  /** Game clock of that hit. */
+  lastHitAt = -10;
   private route: { x: number; z: number }[] | null = null;
   private routeIndex = 0;
 

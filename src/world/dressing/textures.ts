@@ -315,6 +315,8 @@ export function createSignAtlas(): THREE.CanvasTexture {
     ctx.lineWidth = 3;
     tube(() => ctx.strokeRect(x + 7, y + 8, 66, 272));
     ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2.6;
     ctx.font = `900 ${size}px ${JP}`;
     const step = Math.min(size * 1.12, 250 / chars.length);
     const top = y + 144 - (step * (chars.length - 1)) / 2;
@@ -324,6 +326,7 @@ export function createSignAtlas(): THREE.CanvasTexture {
           ctx.fillRect(x + 36, top + n * step - size * 0.36, size * 0.13, size * 0.72);
         } else {
           ctx.fillText(ch, x + 40, top + n * step + 2);
+          ctx.strokeText(ch, x + 40, top + n * step + 2);
         }
       });
     });
@@ -339,7 +342,12 @@ export function createSignAtlas(): THREE.CanvasTexture {
     tube(() => ctx.strokeRect(x + 8, y + 7, 240, 58));
     ctx.fillStyle = '#ffffff';
     ctx.font = `900 40px ${JP}`;
-    tube(() => ctx.fillText(text, x + 128, y + 38, 216));
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2.2;
+    tube(() => {
+      ctx.fillText(text, x + 128, y + 38, 216);
+      ctx.strokeText(text, x + 128, y + 38, 216);
+    });
     SIGN.neonH.push(uvRect(x, y, 256, 72, W, H, 1));
   });
 
@@ -688,7 +696,7 @@ export function createCardAtlas(): THREE.CanvasTexture {
         const lean = (rng() - 0.5) * (70 + i * 14);
         const height = (0.45 + rng() * 0.5) * (h - 10) * (i === 3 ? 0.7 : 1);
         const tone = rng();
-        ctx.strokeStyle = `rgb(${150 + tone * 75},${120 + tone * 62},${58 + tone * 40})`;
+        ctx.strokeStyle = `rgb(${128 + tone * 60},${112 + tone * 50},${78 + tone * 40})`;
         ctx.lineWidth = 2.2 + rng() * 2.4;
         ctx.beginPath();
         ctx.moveTo(bx, h - 3);
@@ -696,7 +704,7 @@ export function createCardAtlas(): THREE.CanvasTexture {
         ctx.stroke();
         if (i >= 2 && rng() < 0.4) {
           // seed head
-          ctx.fillStyle = 'rgb(205,180,120)';
+          ctx.fillStyle = 'rgb(185,165,125)';
           ctx.beginPath();
           ctx.ellipse(bx + lean, h - height, 2.5, 6, lean * 0.01, 0, Math.PI * 2);
           ctx.fill();
@@ -723,7 +731,7 @@ export function createCardAtlas(): THREE.CanvasTexture {
       for (let n = 0; n < 5 + i; n += 1) twig(w / 2 + (rng() - 0.5) * 16, h - 3, -Math.PI / 2 + (rng() - 0.5) * 1.5, 26 + rng() * 10, 3.6, 66 + rng() * 30);
     });
     cell((6 + i) * 128, 0, 128, 128, (w, h) => {
-      for (let n = 0; n < 4; n += 1) twig(w / 2 + (rng() - 0.5) * 8, h - 3, -Math.PI / 2 + (rng() - 0.5) * 1.1, 30 + rng() * 8, 3.2, 34 + rng() * 22);
+      for (let n = 0; n < 3; n += 1) twig(w / 2 + (rng() - 0.5) * 8, h - 3, -Math.PI / 2 + (rng() - 0.5) * 1.2, 32 + rng() * 8, 2.5, 40 + rng() * 26);
     });
   }
   // concertina wire

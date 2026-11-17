@@ -76,11 +76,11 @@ export class ScoreSystem {
 
 /** S/A/B/C/D from score with a pace bonus and a damage penalty. */
 export function computeRank(score: number, timeSec: number, damageTaken: number): string {
-  const rating = score + Math.max(0, 420 - timeSec) * 6 - damageTaken * 7;
-  if (rating >= 9000) return 'S';
-  if (rating >= 6800) return 'A';
-  if (rating >= 4800) return 'B';
-  if (rating >= 3000) return 'C';
+  const rating = score + Math.max(0, 600 - timeSec) * 10 - damageTaken * 10;
+  if (rating >= 26000) return 'S';
+  if (rating >= 19000) return 'A';
+  if (rating >= 13000) return 'B';
+  if (rating >= 8000) return 'C';
   return 'D';
 }
 

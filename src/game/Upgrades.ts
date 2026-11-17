@@ -62,7 +62,7 @@ export class Upgrades {
   get ramSelfDamage(): number { return 0.6 ** this.levels.ram; }
   get magnetRadius(): number { return BASE_MAGNET_RADIUS * (1 + 0.6 * this.levels.magnet); }
   /** Light enemy health scaling so a stacked build does not trivialise the fights. */
-  get enemyHealthScale(): number { return 1 + 0.15 * Math.min(6, Math.max(0, this.owned - 2)); }
+  get enemyHealthScale(): number { return 1 + 0.08 * Math.min(6, Math.max(0, this.owned - 2)); }
 
   /** Draw three distinct options. `needsRepair` makes the repair kit more likely to show up. */
   draw(rng: () => number, needsRepair: boolean): UpgradeOption[] {
