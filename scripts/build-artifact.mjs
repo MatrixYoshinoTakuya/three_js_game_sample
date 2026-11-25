@@ -41,6 +41,20 @@ html, body, #app { width: 100%; height: 100%; }
   clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
   cursor: pointer;
 }
+#install-note {
+  position: fixed;
+  z-index: 60;
+  top: calc(env(safe-area-inset-top, 0px) + 26px);
+  right: calc(max(16px, env(safe-area-inset-right, 0px)) + 68px);
+  max-width: min(46ch, 52vw);
+  margin: 0;
+  padding: 8px 12px;
+  font: 12px/1.5 "Hiragino Kaku Gothic ProN", "Yu Gothic", "Noto Sans JP", sans-serif;
+  color: var(--ash, #e9e1d2);
+  background: rgba(14, 10, 8, 0.72);
+  border-left: 2px solid var(--amber, #ffb347);
+  pointer-events: none;
+}
 #install-app:hover { background: var(--amber, #ffb347); color: var(--void); }
 #install-app:focus-visible { outline: 2px solid var(--ash, #e9e1d2); outline-offset: 3px; }
 #install-app:disabled { opacity: 0.55; cursor: default; }
@@ -49,6 +63,7 @@ html, body, #app { width: 100%; height: 100%; }
   <canvas id="game-canvas" aria-label="ASHEN SKYLINE のゲーム画面"></canvas>
 </main>
 <button type="button" id="install-app" hidden>アプリとしてインストール</button>
+<p id="install-note" hidden></p>
 <script type="module" src="game.js"></script>
 <script type="module">
 // Desktop app support: an icon of its own, a sensible window, and an install
@@ -115,7 +130,28 @@ if (desktop?.window) {
 }
 
 const button = document.getElementById('install-app');
-const installable = (await desktop?.install?.state().catch(() => 'unavailable')) === 'available';
+const installState = desktop ? await (desktop.install ? desktop.install.state().catch(() => 'error') : 'no-install') : 'no-desktop';
+const installable = installState === 'available';
+// When the app cannot be installed from this view, say why on the title screen:
+// "no-desktop" = the desktop-app feature is off for this account/organization or
+// this view does not serve it; "unavailable" = the feature is on but this view
+// (browser, pop-out window) is not one the Claude desktop app installs from.
+const note = document.getElementById('install-note');
+if (note && !installable && !desktop?.fs) {
+  const reason = {
+    'no-desktop': 'この表示ではデスクトップアプリ機能が提供されていません（機能が未提供・組織設定でオフ・未対応の画面のいずれか）',
+    unavailable: '機能は有効ですが、この画面からはインストールできません（Claude Desktop のメイン画面で開いてください）',
+    installed: 'このコンピュータにはインストール済みです',
+    'no-install': 'インストール機能を取得できませんでした',
+    error: 'インストール状態の確認に失敗しました',
+  }[installState] ?? installState;
+  note.textContent = 'アプリ化: ' + reason;
+  const syncNote = () => {
+    note.hidden = document.getElementById('hud-root')?.dataset.mode !== 'title';
+  };
+  syncNote();
+  setInterval(syncNote, 400);
+}
 if (button && installable) {
   // Offer it on the title screen only, so it never sits over the HUD in play.
   const sync = () => {
