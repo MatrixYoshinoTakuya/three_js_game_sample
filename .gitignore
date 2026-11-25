@@ -6,3 +6,4 @@ artifacts/
 .DS_Store
 .claude/repo-facts.local.md
 scratch-*/
+artifact-build/

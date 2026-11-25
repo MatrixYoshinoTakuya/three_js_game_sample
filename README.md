@@ -65,6 +65,21 @@ npm run build
 | `src/ui/` | HUD、ミニマップ、タッチ操作、各種画面 |
 | `docs/` | 設計メモ、検証記録、スクリーンショット |
 
+## アプリとしてインストール（Claude Desktop）
+
+Claude のアーティファクトとして公開済み: https://claude.ai/artifact/EuFAem98TywjVrT9JqT8wK （非公開。所有者と共有相手のみ）
+
+Claude Desktop（Mac / Windows、6.28899.0 以降、ベータ機能）でアーティファクトを開き、タイトルメニュー（または右クリック）→「アプリとしてインストール」→「インストール」。
+手順の出典: https://support.claude.com/ja/articles/18516354
+
+アーティファクト用ファイルの再生成:
+
+```bash
+npm run build:artifact
+```
+
+`artifact-build/ashen-skyline.html`（ページ本体）と `artifact-build/game.js`（ゲーム本体）が出力されます。
+
 ## テスト用フック
 
 `window.__THREE_GAME_TEST_HOOKS__` に `seed` / `setState` / `setPausedForScreenshot` / `setReducedMotion` / `advance` を公開。
